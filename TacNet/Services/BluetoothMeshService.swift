@@ -909,9 +909,7 @@ final class AVAudioEngineRecorder: NSObject, AudioCapturing, @unchecked Sendable
 
     func startCapture() async throws {
         do {
-            try await MainActor.run {
-                try startCaptureOnMainActor()
-            }
+            try await startCaptureOnMainActor()
         } catch let error as AudioServiceError {
             throw error
         } catch {
@@ -941,25 +939,28 @@ final class AVAudioEngineRecorder: NSObject, AudioCapturing, @unchecked Sendable
     }
 
     @MainActor
-    private func startCaptureOnMainActor() throws {
+    private func startCaptureOnMainActor() async throws {
         guard !isCapturing else {
             throw AudioServiceError.alreadyRecording
         }
 
-        // Log microphone permission status before touching the audio engine.
-        let micStatus: String
-        switch AVAudioApplication.shared.recordPermission {
-        case .granted:   micStatus = "granted"
-        case .denied:    micStatus = "DENIED"
-        case .undetermined: micStatus = "undetermined"
-        @unknown default: micStatus = "unknown"
-        }
-        NSLog("[Audio] Microphone permission: %@", micStatus)
-        guard AVAudioApplication.shared.recordPermission == .granted else {
-            NSLog("[Audio] ❌ Microphone permission not granted — recording will be silent")
-            // Don't throw here; let the user see the permission prompt via the UI.
-            // We continue so that if permission is later granted the engine can start.
+        // Request microphone permission if not yet determined; bail if denied.
+        let permission = AVAudioApplication.shared.recordPermission
+        if permission == .undetermined {
+            NSLog("[Audio] Microphone permission: undetermined — requesting now")
+            let granted = await withCheckedContinuation { cont in
+                AVAudioApplication.requestRecordPermission { result in cont.resume(returning: result) }
+            }
+            NSLog("[Audio] Microphone permission result: %@", granted ? "granted" : "DENIED")
+            guard granted else {
+                NSLog("[Audio] ❌ Microphone permission denied — open Settings → TacNet → Microphone")
+                return
+            }
+        } else if permission == .denied {
+            NSLog("[Audio] ❌ Microphone permission denied — open Settings → TacNet → Microphone")
             return
+        } else {
+            NSLog("[Audio] Microphone permission: granted")
         }
 
         // Configure the audio session for recording BEFORE touching AVAudioEngine.
@@ -1130,8 +1131,8 @@ actor AudioService {
         transcriber: CactusTranscribing = CactusTranscriber(),
         transcriptConsumer: TranscriptConsuming? = nil,
         maxRecordingDuration: TimeInterval = 60,
-        silenceAmplitudeThreshold: Int16 = 500,
-        minimumActiveSamples: Int = 160
+        silenceAmplitudeThreshold: Int16 = 100,
+        minimumActiveSamples: Int = 1
     ) {
         self.capturer = capturer
         self.transcriber = transcriber
@@ -1789,8 +1790,8 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
 
         pendingTreeConfigReadCompletions[peerID, default: []].append(completion)
 
-        // Timeout: if the GATT read hasn't completed in 10s, fail the join.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+        // Timeout: if the GATT read hasn't completed in 20s, fail the join.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self,
                   self.pendingTreeConfigReadCompletions[peerID] != nil else { return }
             NSLog("[Join] ⏱ requestTreeConfig timed out for peer %@", peerID.uuidString)
@@ -1825,9 +1826,16 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
         if connectedPeripherals[peerID] != nil {
             NSLog("[Join] Connected but no characteristics yet — triggering service discovery")
             peripheral.discoverServices([BluetoothMeshUUIDs.service])
-        } else if let centralManager, centralManager.state == .poweredOn,
-                  !connectingPeripheralIDs.contains(peerID) {
-            NSLog("[Join] Not connected — initiating connection to peer %@", peerID.uuidString)
+        } else if let centralManager, centralManager.state == .poweredOn {
+            if connectingPeripheralIDs.contains(peerID) {
+                // A previous auto-connect attempt stalled. Cancel it and force a fresh
+                // connect so the user's explicit tap isn't blocked by a stale pending attempt.
+                NSLog("[Join] Stalled auto-connect detected for peer %@ — cancelling and reconnecting", peerID.uuidString)
+                centralManager.cancelPeripheralConnection(peripheral)
+                connectingPeripheralIDs.remove(peerID)
+            } else {
+                NSLog("[Join] Not connected — initiating connection to peer %@", peerID.uuidString)
+            }
             connectingPeripheralIDs.insert(peerID)
             centralManager.connect(peripheral, options: nil)
         } else {

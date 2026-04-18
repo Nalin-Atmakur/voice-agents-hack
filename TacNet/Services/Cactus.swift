@@ -774,7 +774,12 @@ public enum URLSessionDownloadClientError: Error {
     case httpError(statusCode: Int)
 }
 
-public final class URLSessionDownloadClient: NSObject, URLSessionDownloading {
+public final class URLSessionDownloadClient: NSObject, URLSessionDownloading, @unchecked Sendable {
+    /// Shared singleton — AppDelegate references this to reconnect background session events.
+    public static let shared = URLSessionDownloadClient()
+
+    public static let backgroundSessionIdentifier = "com.tacnet.model-download"
+
     private struct CallbackBundle {
         let progress: @Sendable (Int64, Int64) -> Void
         let completion: @Sendable (Result<URL, Error>) -> Void
@@ -783,14 +788,32 @@ public final class URLSessionDownloadClient: NSObject, URLSessionDownloading {
     private let lock = NSLock()
     private var callbacksByTaskID: [Int: CallbackBundle] = [:]
     private var downloadedLocationsByTaskID: [Int: URL] = [:]
+    // Stored by AppDelegate when iOS wakes the app to deliver background session events.
+    private var backgroundSystemCompletionHandler: (() -> Void)?
 
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
+    // URLSession is var! so it can be assigned after super.init() when self is available.
+    // Background session: iOS runs the download in a separate daemon — survives screen-lock,
+    // app backgrounding, and OS-initiated app termination.
+    private var session: URLSession!
+
+    public override init() {
+        super.init()
+        let config = URLSessionConfiguration.background(
+            withIdentifier: URLSessionDownloadClient.backgroundSessionIdentifier
+        )
         config.timeoutIntervalForRequest = 300
         config.timeoutIntervalForResource = 86400
         config.waitsForConnectivity = true
-        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
-    }()
+        config.isDiscretionary = false       // start immediately, don't wait for low-power window
+        config.sessionSendsLaunchEvents = true  // wake the app when the download finishes
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    /// Called by AppDelegate when iOS wakes the app for a completed background session.
+    /// Must be called before application(_:handleEventsForBackgroundURLSession:) returns.
+    public func handleBackgroundSessionEvents(completionHandler: @escaping () -> Void) {
+        lock.withLock { backgroundSystemCompletionHandler = completionHandler }
+    }
 
     public func download(
         request: ModelDownloadRequest,
@@ -900,6 +923,18 @@ extension URLSessionDownloadClient: URLSessionDownloadDelegate {
 
         callbackBundle.completion(.success(downloadedLocation))
     }
+
+    // Called by iOS after all background session events have been delivered.
+    // Invoking the stored system handler tells iOS the app has processed the events
+    // and its snapshot can be updated.
+    public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        let handler = lock.withLock {
+            let h = backgroundSystemCompletionHandler
+            backgroundSystemCompletionHandler = nil
+            return h
+        }
+        DispatchQueue.main.async { handler?() }
+    }
 }
 
 public enum ModelDownloadServiceError: Error, Equatable {
@@ -929,7 +964,7 @@ public actor ModelDownloadService {
 
     public init(
         configuration: ModelDownloadConfiguration = .live,
-        downloader: URLSessionDownloading = URLSessionDownloadClient(),
+        downloader: URLSessionDownloading = URLSessionDownloadClient.shared,
         storageChecker: StorageChecking = VolumeStorageChecker(),
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
@@ -964,6 +999,15 @@ public actor ModelDownloadService {
         synchronizeCompletionState() ? modelDirectoryURL.path : nil
     }
 
+    /// Deletes the model directory and sentinel so the next launch triggers a fresh download.
+    /// Called when cactusInit fails (e.g. a corrupt weight file that passed the sentinel check).
+    public func invalidateDownload() {
+        NSLog("[ModelDownload] ⚠️ Invalidating model cache — will re-download on next launch")
+        try? fileManager.removeItem(at: modelDirectoryURL)
+        try? fileManager.removeItem(at: modelFileURL)
+        userDefaults.set(false, forKey: completionKey)
+    }
+
     private static let maxRetryAttempts = 5
     private static let retryBaseDelay: UInt64 = 2_000_000_000 // 2 seconds in nanoseconds
 
@@ -991,11 +1035,14 @@ public actor ModelDownloadService {
             return modelDirectoryURL
         }
 
+        // During extraction both the zip and the extracted files exist simultaneously,
+        // so require 2× the model size (zip ~6.4 GB + extracted ~8.1 GB).
+        let requiredStorage = configuration.expectedModelSizeBytes * 2
         let availableStorage = try storageChecker.availableStorageBytes(for: applicationSupportDirectory)
-        NSLog("[ModelDownload] Storage check — available: %lld bytes, required: %lld bytes", availableStorage, configuration.expectedModelSizeBytes)
-        guard availableStorage >= configuration.expectedModelSizeBytes else {
+        NSLog("[ModelDownload] Storage check — available: %lld bytes, required: %lld bytes", availableStorage, requiredStorage)
+        guard availableStorage >= requiredStorage else {
             throw ModelDownloadServiceError.insufficientStorage(
-                requiredBytes: configuration.expectedModelSizeBytes,
+                requiredBytes: requiredStorage,
                 availableBytes: availableStorage
             )
         }
@@ -1056,12 +1103,27 @@ public actor ModelDownloadService {
                         try fileManager.removeItem(at: modelDirectoryURL)
                     }
 
-                    NSLog("[ModelDownload] Extracting zip to %@", modelDirectoryURL.path)
+                    // Move zip from the volatile tmp directory into Application Support
+                    // before extraction. iOS can purge /tmp at any time; Application
+                    // Support is persistent and survives across extraction (which can
+                    // take several minutes for 6.4 GB on device).
+                    let stableZipURL = applicationSupportDirectory
+                        .appendingPathComponent("gemma-download-staging.zip")
+                    if fileManager.fileExists(atPath: stableZipURL.path) {
+                        try? fileManager.removeItem(at: stableZipURL)
+                    }
+                    try fileManager.moveItem(at: temporaryLocation, to: stableZipURL)
+                    NSLog("[ModelDownload] Zip staged at %@ — beginning extraction", stableZipURL.path)
+
                     // The zip contains 2088 .weights files at its root (no top-level
-                    // subdirectory), so extract directly into modelDirectoryURL so
-                    // all files land in the right place for cactusInit.
-                    try fileManager.unzipItem(at: temporaryLocation, to: modelDirectoryURL)
-                    try? fileManager.removeItem(at: temporaryLocation)
+                    // subdirectory), so extract directly into modelDirectoryURL.
+                    do {
+                        try fileManager.unzipItem(at: stableZipURL, to: modelDirectoryURL)
+                    } catch {
+                        try? fileManager.removeItem(at: stableZipURL)
+                        throw error
+                    }
+                    try? fileManager.removeItem(at: stableZipURL)
                     NSLog("[ModelDownload] Extraction complete")
 
                     guard fileManager.fileExists(atPath: modelDirectoryURL.path) else {
@@ -1362,7 +1424,7 @@ public actor CactusModelInitializationService {
             throw CactusModelInitializationError.downloadIncomplete
         }
 
-        return try initialize(using: modelDirectoryPath)
+        return try await initialize(using: modelDirectoryPath)
     }
 
     public func initializeModelAfterEnsuringDownload(
@@ -1373,7 +1435,7 @@ public actor CactusModelInitializationService {
         }
 
         let modelDirectory = try await downloadService.ensureModelAvailable(progressHandler: progressHandler)
-        return try initialize(using: modelDirectory.path)
+        return try await initialize(using: modelDirectory.path)
     }
 
     public func destroyModelIfLoaded() {
@@ -1382,12 +1444,14 @@ public actor CactusModelInitializationService {
         self.loadedModelHandle = nil
     }
 
-    private func initialize(using modelPath: String) throws -> CactusModelT {
+    private func initialize(using modelPath: String) async throws -> CactusModelT {
         do {
             let handle = try initFunction(modelPath, nil, false)
             loadedModelHandle = handle
             return handle
         } catch {
+            NSLog("[ModelDownload] ❌ cactusInit failed — invalidating cache so re-download triggers on next launch: %@", error.localizedDescription)
+            await downloadService.invalidateDownload()
             throw CactusModelInitializationError.initializationFailed(error.localizedDescription)
         }
     }
