@@ -121,6 +121,32 @@ The mission runner expects a commit per feature. Stage and commit the implementa
 
 ---
 
+## Xcode Project Manipulation Tips
+
+### Adding new targets (e.g., a UI test target)
+
+Editing `TacNet.xcodeproj/project.pbxproj` by hand is error-prone. Use the `xcodeproj` Ruby gem instead (pre-installed at `/opt/homebrew/opt/ruby/bin/gem`):
+
+```bash
+/opt/homebrew/opt/ruby/bin/gem install xcodeproj  # if missing
+```
+
+Then write a short Ruby script that opens the project, adds the target, wires it into the shared scheme (as a `TestableReference` + `BuildActionEntry`), and saves. This is the recommended approach for: adding `TacNetUITests`, adding new library targets, modifying build-phases programmatically.
+
+## SwiftUI Accessibility Identifier Pitfall
+
+When adding `.accessibilityIdentifier("foo")` on a container view (Stack/Group/NavigationView) that has identified children, SwiftUI will propagate the container id onto every child unless you FIRST mark the container as a compound element:
+
+```swift
+VStack { ... }
+    .accessibilityElement(children: .contain)   // <-- required before the id
+    .accessibilityIdentifier("tacnet.main.root")
+```
+
+Without `.accessibilityElement(children: .contain)`, XCUITest will see only the container's identifier and child identifiers become unreachable. This is a common footgun — check for it whenever a UI test can't find a child element it "should" see.
+
+---
+
 ## Example Handoff
 
 ```json
