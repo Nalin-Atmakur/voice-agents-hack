@@ -2,6 +2,31 @@ import SwiftUI
 import Combine
 import UniformTypeIdentifiers
 
+/// Small bundle of launch-argument-driven flags used by XCUITest to drive the app
+/// deterministically without requiring real BLE, real model weights, or real network.
+///
+/// Activated by passing launch arguments on `XCUIApplication.launchArguments` from the
+/// UI test target. All flags are no-ops in normal production launches.
+enum UITestMode {
+    /// Passing `--ui-test-skip-download` short-circuits the model download gate so UI
+    /// tests reach the onboarding/main screens immediately.
+    static var skipDownload: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-skip-download")
+    }
+
+    /// Passing `--ui-test-route=<name>` replaces the root view with a dedicated host
+    /// for a specific screen that is otherwise unreachable in Simulator (e.g. PIN
+    /// entry, which requires a discovered BLE network).
+    static var route: String? {
+        for arg in ProcessInfo.processInfo.arguments {
+            if arg.hasPrefix("--ui-test-route=") {
+                return String(arg.dropFirst("--ui-test-route=".count))
+            }
+        }
+        return nil
+    }
+}
+
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var bootstrapViewModel = AppBootstrapViewModel()
@@ -21,7 +46,9 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if bootstrapViewModel.isDownloadComplete {
+            if let route = UITestMode.route {
+                UITestRouteHost(route: route)
+            } else if bootstrapViewModel.isDownloadComplete {
                 mainAppShell
             } else {
                 downloadGate
@@ -105,6 +132,7 @@ struct ContentView: View {
             Text("Preparing On-Device AI Model")
                 .font(.title3)
                 .fontWeight(.semibold)
+                .accessibilityIdentifier("tacnet.downloadGate.title")
 
             Text(bootstrapViewModel.modelName)
                 .font(.subheadline)
@@ -113,6 +141,7 @@ struct ContentView: View {
             ProgressView(value: bootstrapViewModel.downloadProgress, total: 1)
                 .progressViewStyle(.linear)
                 .frame(maxWidth: 260)
+                .accessibilityIdentifier("tacnet.downloadGate.progressBar")
 
             VStack(spacing: 4) {
                 Text(bootstrapViewModel.progressLabel)
@@ -134,6 +163,7 @@ struct ContentView: View {
                     bootstrapViewModel.retry()
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("tacnet.downloadGate.retryButton")
             } else {
                 Text("TacNet features are locked until model download completes.")
                     .font(.footnote)
@@ -143,6 +173,67 @@ struct ContentView: View {
             }
         }
         .padding()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.downloadGate.root")
+    }
+}
+
+/// Hosts a dedicated UI for screens that are unreachable without BLE/network during
+/// UI tests. Triggered via the `--ui-test-route=<name>` launch argument.
+private struct UITestRouteHost: View {
+    let route: String
+
+    var body: some View {
+        switch route {
+        case "pin-entry":
+            UITestPinEntryHost()
+        default:
+            Text("Unknown UI test route: \(route)")
+                .accessibilityIdentifier("tacnet.uiTestRoute.unknown")
+        }
+    }
+}
+
+private struct UITestPinEntryHost: View {
+    @State private var pin: String = ""
+    @State private var errorMessage: String?
+    @State private var lastSubmittedPin: String?
+
+    private let network = DiscoveredNetwork(
+        peerID: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
+        networkID: UUID(uuidString: "00000000-0000-0000-0000-000000000002") ?? UUID(),
+        networkName: "Test Network",
+        openSlotCount: 3,
+        requiresPIN: true
+    )
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 8) {
+                PinEntryView(
+                    network: network,
+                    pin: $pin,
+                    errorMessage: errorMessage,
+                    isJoining: false,
+                    onSubmit: {
+                        lastSubmittedPin = pin
+                    },
+                    onCancel: {
+                        pin = ""
+                        errorMessage = nil
+                    }
+                )
+
+                if let lastSubmittedPin {
+                    Text("Submitted: \(lastSubmittedPin)")
+                        .font(.footnote)
+                        .foregroundStyle(.green)
+                        .accessibilityIdentifier("tacnet.pin.submittedValue")
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("tacnet.pin.host.root")
+        }
     }
 }
 
@@ -172,16 +263,21 @@ struct WelcomeView: View {
                 Button("Create Network", action: onCreateNetwork)
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
+                    .accessibilityIdentifier("tacnet.welcome.createNetworkButton")
 
                 Button("Join Network", action: onJoinNetwork)
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
+                    .accessibilityIdentifier("tacnet.welcome.joinNetworkButton")
             }
             .padding(.horizontal)
 
             Spacer()
         }
         .navigationTitle("Onboarding")
+        // Container-only identifier (does not override child Buttons' identifiers).
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.welcome.root")
     }
 }
 
@@ -218,9 +314,11 @@ struct TreeBuilderView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         TextField("Network name", text: $networkNameDraft)
                             .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("tacnet.treeBuilder.networkNameField")
 
                         SecureField("Optional PIN", text: $pinDraft)
                             .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("tacnet.treeBuilder.pinField")
 
                         HStack {
                             Button("Apply Settings") {
@@ -228,6 +326,7 @@ struct TreeBuilderView: View {
                                 _ = viewModel.updatePin(pinDraft)
                             }
                             .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("tacnet.treeBuilder.applySettingsButton")
 
                             Text("Version \(viewModel.currentVersion)")
                                 .font(.caption)
@@ -241,6 +340,7 @@ struct TreeBuilderView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(onPublishNetwork == nil)
+                            .accessibilityIdentifier("tacnet.treeBuilder.publishButton")
 
                             if isPublished {
                                 Label("Advertising live", systemImage: "dot.radiowaves.left.and.right")
@@ -283,6 +383,7 @@ struct TreeBuilderView: View {
 
                         TextField("Rename selected node", text: $renameDraft)
                             .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("tacnet.treeBuilder.renameField")
 
                         HStack {
                             Button("Rename") {
@@ -291,6 +392,7 @@ struct TreeBuilderView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(selectedNodeID == nil)
+                            .accessibilityIdentifier("tacnet.treeBuilder.renameButton")
 
                             Button("Remove", role: .destructive) {
                                 guard let selectedNodeID else { return }
@@ -302,10 +404,12 @@ struct TreeBuilderView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(selectedNodeID == nil)
+                            .accessibilityIdentifier("tacnet.treeBuilder.removeButton")
                         }
 
                         TextField("New child label", text: $newChildLabelDraft)
                             .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("tacnet.treeBuilder.newChildField")
 
                         HStack {
                             Button("Add Child") {
@@ -318,6 +422,7 @@ struct TreeBuilderView: View {
                                 newChildLabelDraft = ""
                             }
                             .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("tacnet.treeBuilder.addChildButton")
 
                             Button("Clear Tree", role: .destructive) {
                                 guard viewModel.clearTree() else { return }
@@ -326,6 +431,7 @@ struct TreeBuilderView: View {
                                 renameDraft = root.label
                             }
                             .buttonStyle(.bordered)
+                            .accessibilityIdentifier("tacnet.treeBuilder.clearTreeButton")
                         }
                     }
                 }
@@ -339,10 +445,13 @@ struct TreeBuilderView: View {
             .padding()
         }
         .navigationTitle("Tree Builder")
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.treeBuilder.root")
         .toolbar {
             if let onBack {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Back", action: onBack)
+                        .accessibilityIdentifier("tacnet.treeBuilder.backButton")
                 }
             }
         }
@@ -646,8 +755,10 @@ private struct NetworkScanView: View {
                     Text(discoveryService.isScanning ? "Scanning for nearby TacNet networks…" : "No networks found.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("tacnet.scan.emptyStateLabel")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("tacnet.scan.emptyState")
             } else {
                 List(discoveryService.nearbyNetworks) { network in
                     Button {
@@ -678,13 +789,17 @@ private struct NetworkScanView: View {
                     discoveryService.startScanning(timeout: 10)
                 }
                 .buttonStyle(.bordered)
+                .accessibilityIdentifier("tacnet.scan.rescanButton")
 
                 Button("Back", action: onBack)
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("tacnet.scan.backButton")
             }
             .padding(.bottom, 8)
         }
         .padding(.horizontal)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.scan.root")
         .task {
             discoveryService.startScanning(timeout: 10)
         }
@@ -708,29 +823,36 @@ private struct PinEntryView: View {
             Text("Enter PIN for \(network.networkName)")
                 .font(.headline)
                 .multilineTextAlignment(.center)
+                .accessibilityIdentifier("tacnet.pin.title")
 
             SecureField("Network PIN", text: $pin)
                 .textFieldStyle(.roundedBorder)
                 .textContentType(.oneTimeCode)
                 .keyboardType(.numberPad)
+                .accessibilityIdentifier("tacnet.pin.field")
 
             if let errorMessage {
                 Text(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
+                    .accessibilityIdentifier("tacnet.pin.errorLabel")
             }
 
             HStack(spacing: 10) {
                 Button("Cancel", action: onCancel)
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier("tacnet.pin.cancelButton")
 
                 Button(isJoining ? "Joining…" : "Join Network", action: onSubmit)
                     .buttonStyle(.borderedProminent)
                     .disabled(isJoining)
+                    .accessibilityIdentifier("tacnet.pin.submitButton")
             }
         }
         .padding()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.pin.root")
     }
 }
 
@@ -776,8 +898,10 @@ private struct RoleSelectionView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(node.claimedBy != nil && node.claimedBy != roleClaimService.localNodeIdentity)
+                    .accessibilityIdentifier("tacnet.roleSelection.row.\(node.id)")
                 }
                 .listStyle(.plain)
+                .accessibilityIdentifier("tacnet.roleSelection.list")
 
                 if let rejection = roleClaimService.lastClaimRejection {
                     Text(rejectionMessage(for: rejection))
@@ -805,9 +929,11 @@ private struct RoleSelectionView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(roleClaimService.activeClaimNodeID == nil)
+                    .accessibilityIdentifier("tacnet.roleSelection.releaseButton")
 
                     Button("Back", action: onBack)
                         .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("tacnet.roleSelection.backButton")
                 }
                 .padding(.bottom, 4)
             } else {
@@ -823,6 +949,8 @@ private struct RoleSelectionView: View {
         }
         .padding(.horizontal)
         .navigationTitle("Role Selection")
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.roleSelection.root")
     }
 
     private func handleClaimTap(nodeID: String) {
@@ -1250,6 +1378,7 @@ struct TreeView: View {
         .onAppear {
             viewModel.refreshFromCurrentTree()
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tacnet.tree.root")
     }
 }
@@ -1466,6 +1595,7 @@ struct DataFlowView: View {
             .padding(.bottom, 12)
         }
         .navigationTitle("Data Flow")
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tacnet.dataflow.root")
     }
 
@@ -2000,6 +2130,7 @@ struct SettingsView: View {
         .sheet(isPresented: $isShowingTreeEditor) {
             SettingsTreeEditorView(viewModel: viewModel)
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tacnet.settings.root")
     }
 
@@ -2369,11 +2500,16 @@ private struct MainView: View {
 
             pttControl
                 .padding(.bottom, 12)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("tacnet.main.pttControl")
         }
         .navigationTitle("Main Feed")
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.main.root")
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("Roles", action: onBackToRoleSelection)
+                    .accessibilityIdentifier("tacnet.main.rolesButton")
             }
         }
         .onAppear {
@@ -3125,6 +3261,15 @@ final class AppBootstrapViewModel: ObservableObject {
     func startIfNeeded() {
         guard !hasStarted else { return }
         hasStarted = true
+
+        if UITestMode.skipDownload {
+            NSLog("[ModelDownload] UI test mode — bypassing download gate")
+            downloadProgress = 1
+            downloadedBytes = expectedModelSizeBytes
+            isDownloadComplete = true
+            errorMessage = nil
+            return
+        }
 
         Task {
             if await downloadService.canUseTacticalFeatures() {
