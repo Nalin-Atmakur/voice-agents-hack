@@ -268,6 +268,152 @@ final class TacNetTests: XCTestCase {
         XCTAssertNotNil(payload["location"], "location field must be present even without live GPS")
     }
 
+    func testMessageRouterBroadcastRoutingSiblingReceives() {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let message = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1",
+            senderRole: "participant",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Contact east"
+        )
+
+        XCTAssertTrue(router.shouldDisplay(message, for: "alpha-2", in: tree))
+    }
+
+    func testMessageRouterBroadcastRoutingParentReceives() {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let message = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1",
+            senderRole: "participant",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Contact east"
+        )
+
+        XCTAssertTrue(router.shouldDisplay(message, for: "alpha", in: tree))
+    }
+
+    func testMessageRouterBroadcastRoutingGrandparentExcluded() {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let message = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1",
+            senderRole: "participant",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Contact east"
+        )
+
+        XCTAssertFalse(router.shouldDisplay(message, for: "root", in: tree))
+    }
+
+    func testMessageRouterBroadcastRoutingCousinExcluded() {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let message = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1",
+            senderRole: "participant",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Contact east"
+        )
+
+        XCTAssertFalse(router.shouldDisplay(message, for: "charlie-1", in: tree))
+    }
+
+    func testMessageRouterCompactionRoutingOnlyParentReceives() {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let message = Message.make(
+            type: .compaction,
+            senderID: "alpha",
+            senderRole: "participant",
+            parentID: "root",
+            treeLevel: 1,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            summary: "Alpha reports contact east"
+        )
+
+        XCTAssertTrue(router.shouldDisplay(message, for: "root", in: tree))
+        XCTAssertFalse(router.shouldDisplay(message, for: "bravo", in: tree))
+        XCTAssertFalse(router.shouldDisplay(message, for: "charlie", in: tree))
+    }
+
+    func testMessageRouterConstructsOutgoingEnvelopeWithRequiredFieldsAndGPS() throws {
+        let tree = makeFixtureTree()
+        let router = MessageRouter(
+            defaultTTL: 0,
+            gpsProvider: {
+                MessageRouter.GPSReading(latitude: 47.6205, longitude: -122.3493, accuracy: 3.2)
+            }
+        )
+
+        let outgoing = router.makeBroadcastMessage(
+            transcript: "Contact east",
+            senderID: "device-alpha-1",
+            senderNodeID: "alpha-1",
+            senderRole: "leaf",
+            in: tree
+        )
+
+        XCTAssertEqual(outgoing.type, .broadcast)
+        XCTAssertEqual(outgoing.senderID, "device-alpha-1")
+        XCTAssertEqual(outgoing.senderRole, "leaf")
+        XCTAssertEqual(outgoing.parentID, "alpha")
+        XCTAssertEqual(outgoing.treeLevel, 2)
+        XCTAssertGreaterThan(outgoing.ttl, 0, "Outgoing envelope must always have ttl > 0")
+        XCTAssertEqual(outgoing.payload.transcript, "Contact east")
+        XCTAssertNil(outgoing.payload.summary)
+        XCTAssertEqual(outgoing.payload.location.lat, 47.6205, accuracy: 0.000001)
+        XCTAssertEqual(outgoing.payload.location.lon, -122.3493, accuracy: 0.000001)
+        XCTAssertEqual(outgoing.payload.location.accuracy, 3.2, accuracy: 0.000001)
+        XCTAssertFalse(outgoing.payload.location.isFallback)
+
+        let encoded = try JSONEncoder().encode(outgoing)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let idString = try XCTUnwrap(json["id"] as? String)
+        XCTAssertNotNil(UUID(uuidString: idString), "Outgoing id must be a valid UUID string")
+        XCTAssertNotNil(json["timestamp"], "Outgoing envelope must include a timestamp")
+        XCTAssertGreaterThan((json["ttl"] as? NSNumber)?.intValue ?? 0, 0)
+
+        let payload = try XCTUnwrap(json["payload"] as? [String: Any])
+        let location = try XCTUnwrap(payload["location"] as? [String: Any])
+        XCTAssertTrue(location["lat"] is NSNumber)
+        XCTAssertTrue(location["lon"] is NSNumber)
+        XCTAssertTrue(location["accuracy"] is NSNumber)
+    }
+
     func testTreeHelpersParentLookupForRootLeafIntermediateAndMissing() {
         let tree = makeFixtureTree()
 

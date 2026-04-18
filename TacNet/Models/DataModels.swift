@@ -233,6 +233,143 @@ struct Message: Codable, Equatable, Sendable {
     }
 }
 
+struct MessageRouter: Sendable {
+    struct GPSReading: Equatable, Sendable {
+        var latitude: Double?
+        var longitude: Double?
+        var accuracy: Double?
+
+        static let unavailable = GPSReading(latitude: nil, longitude: nil, accuracy: nil)
+    }
+
+    typealias GPSProvider = @Sendable () -> GPSReading
+
+    private let defaultTTL: Int
+    private let gpsProvider: GPSProvider
+
+    init(
+        defaultTTL: Int = 8,
+        gpsProvider: @escaping GPSProvider = { .unavailable }
+    ) {
+        self.defaultTTL = max(1, defaultTTL)
+        self.gpsProvider = gpsProvider
+    }
+
+    func shouldDisplay(_ message: Message, for recipientNodeID: String, in tree: TreeNode) -> Bool {
+        switch message.type {
+        case .broadcast:
+            return broadcastRecipientNodeIDs(for: message, in: tree).contains(recipientNodeID)
+        case .compaction:
+            return compactionRecipientNodeIDs(for: message, in: tree).contains(recipientNodeID)
+        default:
+            return false
+        }
+    }
+
+    func makeBroadcastMessage(
+        transcript: String,
+        senderID: String,
+        senderNodeID: String,
+        senderRole: String,
+        in tree: TreeNode,
+        ttl: Int? = nil,
+        encrypted: Bool = false,
+        timestamp: Date = Date()
+    ) -> Message {
+        let gps = gpsProvider()
+        return Message.make(
+            type: .broadcast,
+            senderID: senderID,
+            senderRole: senderRole,
+            parentID: TreeHelpers.parent(of: senderNodeID, in: tree)?.id,
+            treeLevel: TreeHelpers.level(of: senderNodeID, in: tree) ?? 0,
+            ttl: max(1, ttl ?? defaultTTL),
+            encrypted: encrypted,
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            accuracy: gps.accuracy,
+            transcript: transcript,
+            timestamp: timestamp
+        )
+    }
+
+    func makeCompactionMessage(
+        summary: String,
+        senderID: String,
+        senderNodeID: String,
+        senderRole: String,
+        in tree: TreeNode,
+        ttl: Int? = nil,
+        encrypted: Bool = false,
+        timestamp: Date = Date()
+    ) -> Message {
+        let gps = gpsProvider()
+        return Message.make(
+            type: .compaction,
+            senderID: senderID,
+            senderRole: senderRole,
+            parentID: TreeHelpers.parent(of: senderNodeID, in: tree)?.id,
+            treeLevel: TreeHelpers.level(of: senderNodeID, in: tree) ?? 0,
+            ttl: max(1, ttl ?? defaultTTL),
+            encrypted: encrypted,
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            accuracy: gps.accuracy,
+            summary: summary,
+            timestamp: timestamp
+        )
+    }
+
+    private func broadcastRecipientNodeIDs(for message: Message, in tree: TreeNode) -> Set<String> {
+        guard let parentID = resolvedParentID(for: message, in: tree) else {
+            return []
+        }
+
+        let senderNodeID = resolveSenderNodeID(for: message, in: tree)
+        let siblingNodeIDs = TreeHelpers.children(of: parentID, in: tree)
+            .map(\.id)
+            .filter { $0 != senderNodeID }
+
+        return Set(siblingNodeIDs + [parentID])
+    }
+
+    private func compactionRecipientNodeIDs(for message: Message, in tree: TreeNode) -> Set<String> {
+        guard let parentID = resolvedParentID(for: message, in: tree) else {
+            return []
+        }
+        return [parentID]
+    }
+
+    private func resolvedParentID(for message: Message, in tree: TreeNode) -> String? {
+        if let senderNodeID = resolveSenderNodeID(for: message, in: tree) {
+            return TreeHelpers.parent(of: senderNodeID, in: tree)?.id
+        }
+        return message.parentID
+    }
+
+    private func resolveSenderNodeID(for message: Message, in tree: TreeNode) -> String? {
+        if TreeHelpers.level(of: message.senderID, in: tree) != nil {
+            return message.senderID
+        }
+
+        return findNodeID(claimedBy: message.senderID, in: tree)
+    }
+
+    private func findNodeID(claimedBy deviceID: String, in tree: TreeNode) -> String? {
+        if tree.claimedBy == deviceID {
+            return tree.id
+        }
+
+        for child in tree.children {
+            if let nodeID = findNodeID(claimedBy: deviceID, in: child) {
+                return nodeID
+            }
+        }
+
+        return nil
+    }
+}
+
 struct NodeIdentity: Codable, Equatable, Sendable {
     var deviceID: String
     var claimedNodeID: String?
