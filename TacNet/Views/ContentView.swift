@@ -12,6 +12,7 @@ struct ContentView: View {
         case welcome
         case createNetwork
         case joinNetwork
+        case roleSelection
     }
 
     var body: some View {
@@ -45,12 +46,26 @@ struct ContentView: View {
                     },
                     onPublishNetwork: { config in
                         appNetworkCoordinator.publish(networkConfig: config)
+                        appNetworkCoordinator.activateRoleClaiming(with: config)
+                        onboardingRoute = .roleSelection
                     }
                 )
 
             case .joinNetwork:
                 JoinNetworkFlowView(
                     discoveryService: appNetworkCoordinator.discoveryService,
+                    treeSyncService: appNetworkCoordinator.treeSyncService,
+                    onJoined: { joinedConfig in
+                        appNetworkCoordinator.activateRoleClaiming(with: joinedConfig)
+                        onboardingRoute = .roleSelection
+                    }
+                ) {
+                    onboardingRoute = .welcome
+                }
+
+            case .roleSelection:
+                RoleSelectionView(
+                    roleClaimService: appNetworkCoordinator.roleClaimService,
                     treeSyncService: appNetworkCoordinator.treeSyncService
                 ) {
                     onboardingRoute = .welcome
@@ -385,6 +400,7 @@ private struct TreeNodeTreeView: View {
 private struct JoinNetworkFlowView: View {
     @ObservedObject var discoveryService: NetworkDiscoveryService
     @ObservedObject var treeSyncService: TreeSyncService
+    let onJoined: ((NetworkConfig) -> Void)?
     let onBack: () -> Void
 
     @State private var selectedPINNetwork: DiscoveredNetwork?
@@ -495,7 +511,11 @@ private struct JoinNetworkFlowView: View {
 
         do {
             let joined = try await treeSyncService.join(network: network, pin: pin)
-            joinedConfig = joined
+            if let onJoined {
+                onJoined(joined)
+            } else {
+                joinedConfig = joined
+            }
             selectedPINNetwork = nil
             joinErrorMessage = nil
             discoveryService.stopScanning()
@@ -633,20 +653,211 @@ private struct PinEntryView: View {
     }
 }
 
+private struct RoleSelectionView: View {
+    @ObservedObject var roleClaimService: RoleClaimService
+    @ObservedObject var treeSyncService: TreeSyncService
+    let onBack: () -> Void
+
+    @State private var statusMessage: String?
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if let config = treeSyncService.localConfig {
+                Text(config.networkName)
+                    .font(.headline)
+
+                Text("Tap an open node to claim your role.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                List(flattenedTree(from: config.tree)) { node in
+                    Button {
+                        handleClaimTap(nodeID: node.id)
+                    } label: {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(node.label.isEmpty ? "(unnamed node)" : node.label)
+                                    .font(.subheadline.weight(.medium))
+                                Text(claimStatusText(claimedBy: node.claimedBy))
+                                    .font(.caption)
+                                    .foregroundStyle(claimStatusColor(claimedBy: node.claimedBy))
+                            }
+
+                            Spacer(minLength: 8)
+                            Text(node.id)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .padding(.vertical, 4)
+                        .padding(.leading, CGFloat(node.depth) * 16)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(node.claimedBy != nil && node.claimedBy != roleClaimService.localNodeIdentity)
+                }
+                .listStyle(.plain)
+
+                if let rejection = roleClaimService.lastClaimRejection {
+                    Text(rejectionMessage(for: rejection))
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+
+                if let statusMessage {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Release Role") {
+                        let result = roleClaimService.releaseActiveClaim()
+                        switch result {
+                        case .released(let nodeID):
+                            statusMessage = "Released \(nodeID)."
+                        case .noActiveClaim:
+                            statusMessage = "No claimed role to release."
+                        default:
+                            statusMessage = nil
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(roleClaimService.activeClaimNodeID == nil)
+
+                    Button("Back", action: onBack)
+                        .buttonStyle(.borderedProminent)
+                }
+                .padding(.bottom, 4)
+            } else {
+                Spacer()
+                Text("No tree available yet. Join or publish a network first.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Back", action: onBack)
+                    .buttonStyle(.borderedProminent)
+                Spacer()
+            }
+        }
+        .padding(.horizontal)
+        .navigationTitle("Role Selection")
+    }
+
+    private func handleClaimTap(nodeID: String) {
+        let result = roleClaimService.claim(nodeID: nodeID)
+        switch result {
+        case .claimed(let claimedNodeID):
+            statusMessage = "Claimed \(claimedNodeID)."
+        case .rejected(let reason):
+            statusMessage = rejectionMessage(for: reason)
+        case .unavailable:
+            statusMessage = "Network config unavailable."
+        default:
+            statusMessage = nil
+        }
+    }
+
+    private func claimStatusText(claimedBy: String?) -> String {
+        guard let claimedBy else {
+            return "Open"
+        }
+
+        if claimedBy == roleClaimService.localNodeIdentity {
+            return "Claimed by you"
+        }
+
+        return "Claimed by \(claimedBy)"
+    }
+
+    private func claimStatusColor(claimedBy: String?) -> Color {
+        guard let claimedBy else {
+            return .green
+        }
+        return claimedBy == roleClaimService.localNodeIdentity ? .blue : .secondary
+    }
+
+    private func rejectionMessage(for reason: ClaimRejectionReason) -> String {
+        switch reason {
+        case .alreadyClaimed:
+            return "Claim rejected: node already claimed."
+        case .organiserWins:
+            return "Claim rejected: organiser wins conflict resolution."
+        case .nodeNotFound:
+            return "Claim rejected: selected node no longer exists."
+        }
+    }
+
+    private func flattenedTree(from root: TreeNode) -> [FlatTreeNode] {
+        var nodes: [FlatTreeNode] = []
+        append(node: root, depth: 0, into: &nodes)
+        return nodes
+    }
+
+    private func append(node: TreeNode, depth: Int, into nodes: inout [FlatTreeNode]) {
+        nodes.append(
+            FlatTreeNode(
+                id: node.id,
+                label: node.label,
+                depth: depth,
+                claimedBy: node.claimedBy
+            )
+        )
+        for child in node.children {
+            append(node: child, depth: depth + 1, into: &nodes)
+        }
+    }
+
+    private struct FlatTreeNode: Identifiable {
+        let id: String
+        let label: String
+        let depth: Int
+        let claimedBy: String?
+    }
+}
+
 @MainActor
 final class AppNetworkCoordinator: ObservableObject {
+    let localDeviceID: String
     let meshService: BluetoothMeshService
     let discoveryService: NetworkDiscoveryService
     let treeSyncService: TreeSyncService
+    let roleClaimService: RoleClaimService
 
-    init(meshService: BluetoothMeshService = BluetoothMeshService()) {
+    init(
+        meshService: BluetoothMeshService = BluetoothMeshService(),
+        localDeviceID: String = ProcessInfo.processInfo.hostName
+    ) {
+        self.localDeviceID = localDeviceID
         self.meshService = meshService
         discoveryService = NetworkDiscoveryService(meshService: meshService)
         treeSyncService = TreeSyncService(meshService: meshService)
+        roleClaimService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: treeSyncService,
+            localDeviceID: localDeviceID
+        )
+
+        meshService.onMessageReceived = { [weak self] message in
+            Task { @MainActor in
+                self?.roleClaimService.handleIncomingMessage(message)
+            }
+        }
+
+        meshService.onPeerConnectionStateChanged = { [weak self] peerID, state in
+            Task { @MainActor in
+                self?.roleClaimService.handlePeerStateChange(peerID: peerID, state: state)
+            }
+        }
     }
 
     func publish(networkConfig: NetworkConfig) {
+        treeSyncService.setLocalConfig(networkConfig)
         meshService.publishNetwork(networkConfig)
+    }
+
+    func activateRoleClaiming(with config: NetworkConfig) {
+        treeSyncService.setLocalConfig(config)
+        meshService.start()
     }
 }
 

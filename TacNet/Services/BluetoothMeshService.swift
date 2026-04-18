@@ -937,3 +937,472 @@ final class NetworkDiscoveryService: ObservableObject {
         }
     }
 }
+
+enum ClaimRejectionReason: String, Codable, Equatable, Sendable {
+    case alreadyClaimed = "already_claimed"
+    case organiserWins = "organiser_wins"
+    case nodeNotFound = "node_not_found"
+}
+
+enum RoleClaimResult: Equatable, Sendable {
+    case claimed(nodeID: String)
+    case released(nodeID: String)
+    case rejected(reason: ClaimRejectionReason)
+    case noActiveClaim
+    case unavailable
+}
+
+enum PromoteValidationError: Error, Equatable, Sendable {
+    case networkUnavailable
+    case nodeNotFound
+    case targetUnclaimed
+}
+
+@MainActor
+final class RoleClaimService: ObservableObject {
+    @Published private(set) var activeClaimNodeID: String?
+    @Published private(set) var lastClaimRejection: ClaimRejectionReason?
+    @Published private(set) var networkConfig: NetworkConfig?
+
+    private let meshService: BluetoothMeshService
+    private let treeSyncService: TreeSyncService
+    private let localDeviceID: String
+    private let disconnectTimeout: TimeInterval
+    private var disconnectReleaseTasks: [UUID: Task<Void, Never>] = [:]
+    private var cancellables: Set<AnyCancellable> = []
+
+    private let defaultTTL = 8
+
+    init(
+        meshService: BluetoothMeshService,
+        treeSyncService: TreeSyncService,
+        localDeviceID: String,
+        disconnectTimeout: TimeInterval = 60
+    ) {
+        self.meshService = meshService
+        self.treeSyncService = treeSyncService
+        self.localDeviceID = localDeviceID
+        self.disconnectTimeout = max(0, disconnectTimeout)
+
+        treeSyncService.$localConfig
+            .receive(on: RunLoop.main)
+            .sink { [weak self] config in
+                self?.applyLocalConfigSnapshot(config)
+            }
+            .store(in: &cancellables)
+
+        applyLocalConfigSnapshot(treeSyncService.localConfig)
+    }
+
+    deinit {
+        disconnectReleaseTasks.values.forEach { $0.cancel() }
+    }
+
+    var localNodeIdentity: String {
+        localDeviceID
+    }
+
+    var isOrganiser: Bool {
+        networkConfig?.createdBy == localDeviceID
+    }
+
+    func claim(nodeID: String) -> RoleClaimResult {
+        guard var config = networkConfig else {
+            return .unavailable
+        }
+
+        guard let node = findNode(withID: nodeID, in: config.tree) else {
+            lastClaimRejection = .nodeNotFound
+            return .rejected(reason: .nodeNotFound)
+        }
+
+        if let existingClaim = node.claimedBy, !existingClaim.isEmpty, existingClaim != localDeviceID {
+            if config.createdBy == localDeviceID {
+                guard updateClaim(nodeID: nodeID, claimedBy: localDeviceID, in: &config.tree) else {
+                    return .unavailable
+                }
+
+                treeSyncService.setLocalConfig(config)
+                publishClaim(nodeID: nodeID, claimantID: localDeviceID, in: config)
+                publishClaimRejected(
+                    nodeID: nodeID,
+                    targetDeviceID: existingClaim,
+                    reason: .organiserWins,
+                    in: config
+                )
+                lastClaimRejection = nil
+                return .claimed(nodeID: nodeID)
+            }
+
+            lastClaimRejection = .alreadyClaimed
+            return .rejected(reason: .alreadyClaimed)
+        }
+
+        guard updateClaim(nodeID: nodeID, claimedBy: localDeviceID, in: &config.tree) else {
+            return .unavailable
+        }
+
+        treeSyncService.setLocalConfig(config)
+        publishClaim(nodeID: nodeID, claimantID: localDeviceID, in: config)
+        lastClaimRejection = nil
+        return .claimed(nodeID: nodeID)
+    }
+
+    func releaseActiveClaim() -> RoleClaimResult {
+        guard var config = networkConfig else {
+            return .unavailable
+        }
+
+        guard let claimedNodeID = activeClaimNodeID ?? firstClaimedNodeID(by: localDeviceID, in: config.tree) else {
+            return .noActiveClaim
+        }
+
+        guard updateClaim(nodeID: claimedNodeID, claimedBy: nil, in: &config.tree) else {
+            return .noActiveClaim
+        }
+
+        treeSyncService.setLocalConfig(config)
+        publishRelease(nodeID: claimedNodeID, releasedBy: localDeviceID, in: config)
+        lastClaimRejection = nil
+        return .released(nodeID: claimedNodeID)
+    }
+
+    func validatePromoteTarget(nodeID: String) throws {
+        guard let config = networkConfig else {
+            throw PromoteValidationError.networkUnavailable
+        }
+
+        guard let node = findNode(withID: nodeID, in: config.tree) else {
+            throw PromoteValidationError.nodeNotFound
+        }
+
+        guard let claimant = node.claimedBy, !claimant.isEmpty else {
+            throw PromoteValidationError.targetUnclaimed
+        }
+    }
+
+    func handleIncomingMessage(_ message: Message) {
+        switch message.type {
+        case .claim:
+            handleIncomingClaim(message)
+        case .release:
+            handleIncomingRelease(message)
+        case .claimRejected:
+            handleIncomingClaimRejected(message)
+        default:
+            break
+        }
+    }
+
+    func handlePeerStateChange(peerID: UUID, state: PeerConnectionState) {
+        switch state {
+        case .connected:
+            cancelDisconnectTask(for: peerID)
+
+        case .disconnected:
+            guard isOrganiser else {
+                return
+            }
+            scheduleDisconnectAutoRelease(for: peerID)
+        }
+    }
+
+    private func handleIncomingClaim(_ message: Message) {
+        guard let nodeID = message.payload.claimedNodeID, var config = networkConfig else {
+            return
+        }
+
+        guard let currentNode = findNode(withID: nodeID, in: config.tree) else {
+            if config.createdBy == localDeviceID {
+                publishClaimRejected(
+                    nodeID: nodeID,
+                    targetDeviceID: message.senderID,
+                    reason: .nodeNotFound,
+                    in: config
+                )
+            }
+            return
+        }
+
+        let senderID = message.senderID
+        let organiserID = config.createdBy
+        let existingClaim = currentNode.claimedBy
+
+        if existingClaim == senderID {
+            return
+        }
+
+        if existingClaim == nil || existingClaim?.isEmpty == true {
+            guard updateClaim(nodeID: nodeID, claimedBy: senderID, in: &config.tree) else {
+                return
+            }
+            treeSyncService.setLocalConfig(config)
+            return
+        }
+
+        guard let existingClaim else {
+            return
+        }
+
+        if senderID == organiserID && existingClaim != organiserID {
+            guard updateClaim(nodeID: nodeID, claimedBy: senderID, in: &config.tree) else {
+                return
+            }
+            treeSyncService.setLocalConfig(config)
+            return
+        }
+
+        guard localDeviceID == organiserID else {
+            return
+        }
+
+        if existingClaim == organiserID {
+            publishClaimRejected(
+                nodeID: nodeID,
+                targetDeviceID: senderID,
+                reason: .organiserWins,
+                in: config
+            )
+            return
+        }
+
+        publishClaimRejected(
+            nodeID: nodeID,
+            targetDeviceID: senderID,
+            reason: .alreadyClaimed,
+            in: config
+        )
+    }
+
+    private func handleIncomingRelease(_ message: Message) {
+        guard let nodeID = message.payload.claimedNodeID, var config = networkConfig else {
+            return
+        }
+
+        guard let currentNode = findNode(withID: nodeID, in: config.tree),
+              let currentClaim = currentNode.claimedBy,
+              !currentClaim.isEmpty else {
+            return
+        }
+
+        let senderID = message.senderID
+        let organiserID = config.createdBy
+        guard senderID == currentClaim || senderID == organiserID else {
+            return
+        }
+
+        guard updateClaim(nodeID: nodeID, claimedBy: nil, in: &config.tree) else {
+            return
+        }
+        treeSyncService.setLocalConfig(config)
+    }
+
+    private func handleIncomingClaimRejected(_ message: Message) {
+        guard message.payload.targetNodeID == localDeviceID else {
+            return
+        }
+
+        if let rawReason = message.payload.rejectionReason,
+           let reason = ClaimRejectionReason(rawValue: rawReason) {
+            lastClaimRejection = reason
+        } else {
+            lastClaimRejection = .alreadyClaimed
+        }
+
+        guard let nodeID = message.payload.claimedNodeID, var config = networkConfig else {
+            return
+        }
+
+        guard let node = findNode(withID: nodeID, in: config.tree),
+              node.claimedBy == localDeviceID else {
+            return
+        }
+
+        guard updateClaim(nodeID: nodeID, claimedBy: nil, in: &config.tree) else {
+            return
+        }
+        treeSyncService.setLocalConfig(config)
+    }
+
+    private func scheduleDisconnectAutoRelease(for peerID: UUID) {
+        let disconnectedOwnerID = peerID.uuidString
+        guard let config = networkConfig,
+              !claimedNodeIDs(by: disconnectedOwnerID, in: config.tree).isEmpty else {
+            return
+        }
+
+        cancelDisconnectTask(for: peerID)
+        disconnectReleaseTasks[peerID] = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let timeoutNanoseconds = UInt64(self.disconnectTimeout * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            guard !Task.isCancelled else {
+                return
+            }
+            await self.performDisconnectAutoReleaseIfNeeded(for: peerID)
+        }
+    }
+
+    private func cancelDisconnectTask(for peerID: UUID) {
+        disconnectReleaseTasks.removeValue(forKey: peerID)?.cancel()
+    }
+
+    private func performDisconnectAutoReleaseIfNeeded(for peerID: UUID) {
+        disconnectReleaseTasks[peerID] = nil
+
+        guard meshService.connectionState(for: peerID) == .disconnected,
+              var config = networkConfig,
+              config.createdBy == localDeviceID else {
+            return
+        }
+
+        let disconnectedOwnerID = peerID.uuidString
+        let nodesToRelease = claimedNodeIDs(by: disconnectedOwnerID, in: config.tree)
+        guard !nodesToRelease.isEmpty else {
+            return
+        }
+
+        for nodeID in nodesToRelease {
+            guard updateClaim(nodeID: nodeID, claimedBy: nil, in: &config.tree) else {
+                continue
+            }
+            publishRelease(nodeID: nodeID, releasedBy: disconnectedOwnerID, in: config)
+        }
+
+        treeSyncService.setLocalConfig(config)
+    }
+
+    private func publishClaim(nodeID: String, claimantID: String, in config: NetworkConfig) {
+        let claimMessage = Message.make(
+            type: .claim,
+            senderID: claimantID,
+            senderRole: senderRole(for: claimantID, in: config),
+            parentID: TreeHelpers.parent(of: nodeID, in: config.tree)?.id,
+            treeLevel: TreeHelpers.level(of: nodeID, in: config.tree) ?? 0,
+            ttl: defaultTTL,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            claimedNodeID: nodeID
+        )
+        meshService.publish(claimMessage)
+    }
+
+    private func publishRelease(nodeID: String, releasedBy: String, in config: NetworkConfig) {
+        let releaseMessage = Message.make(
+            type: .release,
+            senderID: releasedBy,
+            senderRole: senderRole(for: releasedBy, in: config),
+            parentID: TreeHelpers.parent(of: nodeID, in: config.tree)?.id,
+            treeLevel: TreeHelpers.level(of: nodeID, in: config.tree) ?? 0,
+            ttl: defaultTTL,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            claimedNodeID: nodeID
+        )
+        meshService.publish(releaseMessage)
+    }
+
+    private func publishClaimRejected(
+        nodeID: String,
+        targetDeviceID: String,
+        reason: ClaimRejectionReason,
+        in config: NetworkConfig
+    ) {
+        let rejectedMessage = Message.make(
+            type: .claimRejected,
+            senderID: localDeviceID,
+            senderRole: senderRole(for: localDeviceID, in: config),
+            parentID: TreeHelpers.parent(of: nodeID, in: config.tree)?.id,
+            treeLevel: TreeHelpers.level(of: nodeID, in: config.tree) ?? 0,
+            ttl: defaultTTL,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            claimedNodeID: nodeID,
+            targetNodeID: targetDeviceID,
+            rejectionReason: reason.rawValue
+        )
+        meshService.publish(rejectedMessage)
+    }
+
+    private func senderRole(for senderID: String, in config: NetworkConfig) -> String {
+        senderID == config.createdBy ? "organiser" : "participant"
+    }
+
+    private func applyLocalConfigSnapshot(_ config: NetworkConfig?) {
+        networkConfig = config
+        guard let config else {
+            activeClaimNodeID = nil
+            return
+        }
+        activeClaimNodeID = firstClaimedNodeID(by: localDeviceID, in: config.tree)
+    }
+
+    private func findNode(withID nodeID: String, in tree: TreeNode) -> TreeNode? {
+        if tree.id == nodeID {
+            return tree
+        }
+
+        for child in tree.children {
+            if let found = findNode(withID: nodeID, in: child) {
+                return found
+            }
+        }
+
+        return nil
+    }
+
+    @discardableResult
+    private func updateClaim(nodeID: String, claimedBy: String?, in tree: inout TreeNode) -> Bool {
+        if tree.id == nodeID {
+            tree.claimedBy = claimedBy
+            return true
+        }
+
+        for index in tree.children.indices {
+            if updateClaim(nodeID: nodeID, claimedBy: claimedBy, in: &tree.children[index]) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func firstClaimedNodeID(by ownerID: String, in tree: TreeNode) -> String? {
+        if tree.claimedBy == ownerID {
+            return tree.id
+        }
+
+        for child in tree.children {
+            if let claimedNodeID = firstClaimedNodeID(by: ownerID, in: child) {
+                return claimedNodeID
+            }
+        }
+
+        return nil
+    }
+
+    private func claimedNodeIDs(by ownerID: String, in tree: TreeNode) -> [String] {
+        var claimedNodeIDs: [String] = []
+        collectClaimedNodeIDs(by: ownerID, in: tree, into: &claimedNodeIDs)
+        return claimedNodeIDs
+    }
+
+    private func collectClaimedNodeIDs(by ownerID: String, in tree: TreeNode, into collection: inout [String]) {
+        if tree.claimedBy == ownerID {
+            collection.append(tree.id)
+        }
+
+        for child in tree.children {
+            collectClaimedNodeIDs(by: ownerID, in: child, into: &collection)
+        }
+    }
+}

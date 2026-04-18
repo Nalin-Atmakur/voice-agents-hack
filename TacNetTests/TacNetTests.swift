@@ -931,6 +931,188 @@ final class TacNetTests: XCTestCase {
         XCTAssertEqual(syncService.localConfig?.networkID, remote.networkID)
     }
 
+    @MainActor
+    func testRoleClaimServiceClaimOpenNodePublishesClaimAndUpdatesTree() throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let forwardingPeer = UUID(uuidString: "0A0A0A0A-0000-0000-0000-000000000001")!
+        transport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        let networkID = UUID(uuidString: "22222222-3333-4444-5555-666666666666")!
+        syncService.setLocalConfig(makeNetworkConfig(networkID: networkID, version: 1, rootLabel: "Role Tree"))
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "local-device",
+            disconnectTimeout: 60
+        )
+
+        let result = roleService.claim(nodeID: "alpha")
+        XCTAssertEqual(result, .claimed(nodeID: "alpha"))
+        XCTAssertEqual(claimedByValue(nodeID: "alpha", in: syncService.localConfig), "local-device")
+
+        XCTAssertEqual(transport.sentPackets.count, 1)
+        let published = try decodeMessage(from: transport.sentPackets[0].data)
+        XCTAssertEqual(published.type, .claim)
+        XCTAssertEqual(published.payload.claimedNodeID, "alpha")
+    }
+
+    @MainActor
+    func testRoleClaimServiceClaimAlreadyClaimedNodeRejectedAndPreservesExistingClaim() {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let networkID = UUID(uuidString: "77777777-8888-9999-AAAA-BBBBBBBBBBBB")!
+        syncService.setLocalConfig(makeNetworkConfig(networkID: networkID, version: 2, rootLabel: "Role Tree"))
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "contender-device",
+            disconnectTimeout: 60
+        )
+
+        let result = roleService.claim(nodeID: "bravo")
+        XCTAssertEqual(result, .rejected(reason: .alreadyClaimed))
+        XCTAssertEqual(claimedByValue(nodeID: "bravo", in: syncService.localConfig), "claimed-device")
+        XCTAssertEqual(transport.sentPackets.count, 0)
+    }
+
+    @MainActor
+    func testRoleClaimServiceOrganiserRejectsConflictWithOrganiserWinsReason() throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let forwardingPeer = UUID(uuidString: "0B0B0B0B-0000-0000-0000-000000000001")!
+        transport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        let networkID = UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000001")!
+        var config = makeNetworkConfig(networkID: networkID, version: 3, rootLabel: "Role Tree")
+        config.createdBy = "organiser-device"
+        config = withClaim(nodeID: "alpha", claimedBy: "organiser-device", in: config)
+        syncService.setLocalConfig(config)
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "organiser-device",
+            disconnectTimeout: 60
+        )
+
+        let incomingConflict = Message.make(
+            type: .claim,
+            senderID: "participant-2",
+            senderRole: "participant",
+            parentID: "root",
+            treeLevel: 1,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            claimedNodeID: "alpha"
+        )
+
+        roleService.handleIncomingMessage(incomingConflict)
+
+        XCTAssertEqual(claimedByValue(nodeID: "alpha", in: syncService.localConfig), "organiser-device")
+        XCTAssertEqual(transport.sentPackets.count, 1)
+
+        let rejection = try decodeMessage(from: transport.sentPackets[0].data)
+        XCTAssertEqual(rejection.type, .claimRejected)
+        XCTAssertEqual(rejection.payload.claimedNodeID, "alpha")
+        XCTAssertEqual(rejection.payload.targetNodeID, "participant-2")
+        XCTAssertEqual(rejection.payload.rejectionReason, ClaimRejectionReason.organiserWins.rawValue)
+    }
+
+    @MainActor
+    func testRoleClaimServiceManualReleasePublishesReleaseAndOpensNode() throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let forwardingPeer = UUID(uuidString: "0C0C0C0C-0000-0000-0000-000000000001")!
+        transport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        let networkID = UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000002")!
+        var config = makeNetworkConfig(networkID: networkID, version: 4, rootLabel: "Role Tree")
+        config = withClaim(nodeID: "alpha", claimedBy: "local-device", in: config)
+        syncService.setLocalConfig(config)
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "local-device",
+            disconnectTimeout: 60
+        )
+
+        let result = roleService.releaseActiveClaim()
+        XCTAssertEqual(result, .released(nodeID: "alpha"))
+        XCTAssertNil(claimedByValue(nodeID: "alpha", in: syncService.localConfig))
+
+        XCTAssertEqual(transport.sentPackets.count, 1)
+        let releaseMessage = try decodeMessage(from: transport.sentPackets[0].data)
+        XCTAssertEqual(releaseMessage.type, .release)
+        XCTAssertEqual(releaseMessage.payload.claimedNodeID, "alpha")
+    }
+
+    @MainActor
+    func testRoleClaimServiceAutoReleaseAfterDisconnectTimeout() async throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let forwardingPeer = UUID(uuidString: "0D0D0D0D-0000-0000-0000-000000000001")!
+        transport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        let disconnectedPeer = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000001")!
+        let disconnectedDeviceID = disconnectedPeer.uuidString
+
+        let networkID = UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000003")!
+        var config = makeNetworkConfig(networkID: networkID, version: 5, rootLabel: "Role Tree")
+        config.createdBy = "organiser-device"
+        config = withClaim(nodeID: "alpha", claimedBy: disconnectedDeviceID, in: config)
+        syncService.setLocalConfig(config)
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "organiser-device",
+            disconnectTimeout: 0.05
+        )
+
+        roleService.handlePeerStateChange(peerID: disconnectedPeer, state: .disconnected)
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        XCTAssertNil(claimedByValue(nodeID: "alpha", in: syncService.localConfig))
+        XCTAssertEqual(transport.sentPackets.count, 1)
+
+        let releaseMessage = try decodeMessage(from: transport.sentPackets[0].data)
+        XCTAssertEqual(releaseMessage.type, .release)
+        XCTAssertEqual(releaseMessage.payload.claimedNodeID, "alpha")
+        XCTAssertEqual(releaseMessage.senderID, disconnectedDeviceID)
+    }
+
+    @MainActor
+    func testRoleClaimServicePromoteFailsForUnclaimedParticipant() {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+        let networkID = UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000004")!
+        syncService.setLocalConfig(makeNetworkConfig(networkID: networkID, version: 6, rootLabel: "Role Tree"))
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: syncService,
+            localDeviceID: "organiser-device",
+            disconnectTimeout: 60
+        )
+
+        XCTAssertThrowsError(try roleService.validatePromoteTarget(nodeID: "alpha")) { error in
+            XCTAssertEqual(error as? PromoteValidationError, .targetUnclaimed)
+        }
+    }
+
     private func makeMeshMessage(
         id: UUID = UUID(),
         ttl: Int,
@@ -978,6 +1160,47 @@ final class TacNetTests: XCTestCase {
                 ]
             )
         )
+    }
+
+    private func withClaim(nodeID: String, claimedBy: String?, in config: NetworkConfig) -> NetworkConfig {
+        var updated = config
+        _ = mutateClaim(nodeID: nodeID, claimedBy: claimedBy, in: &updated.tree)
+        return updated
+    }
+
+    private func claimedByValue(nodeID: String, in config: NetworkConfig?) -> String? {
+        guard let config else {
+            return nil
+        }
+        return findNode(nodeID: nodeID, in: config.tree)?.claimedBy
+    }
+
+    @discardableResult
+    private func mutateClaim(nodeID: String, claimedBy: String?, in tree: inout TreeNode) -> Bool {
+        if tree.id == nodeID {
+            tree.claimedBy = claimedBy
+            return true
+        }
+
+        for index in tree.children.indices {
+            if mutateClaim(nodeID: nodeID, claimedBy: claimedBy, in: &tree.children[index]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func findNode(nodeID: String, in tree: TreeNode) -> TreeNode? {
+        if tree.id == nodeID {
+            return tree
+        }
+
+        for child in tree.children {
+            if let found = findNode(nodeID: nodeID, in: child) {
+                return found
+            }
+        }
+        return nil
     }
 
     private func makeFixtureTree() -> TreeNode {
