@@ -57,7 +57,7 @@ struct ContentView: View {
         .task {
             bootstrapViewModel.startIfNeeded()
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             appNetworkCoordinator.handleScenePhase(phase)
         }
     }
@@ -455,7 +455,7 @@ struct TreeBuilderView: View {
                 }
             }
         }
-        .onChange(of: selectedNodeID) { newValue in
+        .onChange(of: selectedNodeID) { _, newValue in
             guard
                 let newValue,
                 let node = viewModel.node(withID: newValue)

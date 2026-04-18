@@ -442,7 +442,7 @@ public func cactusIndexAdd(_ index: CactusIndexT, _ ids: [Int32], _ documents: [
 
     var idArray = ids
     var docPtrs = documents.map { strdup($0) }
-    var metaPtrs: [UnsafeMutablePointer<CChar>?]? = metadatas?.map { strdup($0) }
+    let metaPtrs: [UnsafeMutablePointer<CChar>?]? = metadatas?.map { strdup($0) }
     var embPtrs = embeddings.map { emb -> UnsafePointer<Float>? in
         let ptr = UnsafeMutablePointer<Float>.allocate(capacity: emb.count)
         ptr.initialize(from: emb, count: emb.count)
@@ -539,11 +539,11 @@ public func cactusIndexGet(_ index: CactusIndexT, _ ids: [Int32]) throws -> Stri
                                 cactus_index_get(
                                     index,
                                     idPtr.baseAddress, count,
-                                    unsafeBitCast(docPtr.baseAddress, to: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?.self),
+                                    docPtr.baseAddress,
                                     docSzPtr.baseAddress,
-                                    unsafeBitCast(metaPtr.baseAddress, to: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?.self),
+                                    metaPtr.baseAddress,
                                     metaSzPtr.baseAddress,
-                                    unsafeBitCast(embPtr.baseAddress, to: UnsafeMutablePointer<UnsafeMutablePointer<Float>?>?.self),
+                                    embPtr.baseAddress,
                                     embSzPtr.baseAddress
                                 )
                             }
@@ -595,7 +595,7 @@ public func cactusIndexQuery(_ index: CactusIndexT, _ embedding: [Float], _ opti
                     var embPtrPtr: UnsafePointer<Float>? = embPtr.baseAddress.map { UnsafePointer($0) }
                     var idPtrPtr: UnsafeMutablePointer<Int32>? = idPtr.baseAddress
                     var scorePtrPtr: UnsafeMutablePointer<Float>? = scorePtr.baseAddress
-                    var optStrCopy = optStr
+                    let optStrCopy = optStr
                     return withUnsafeMutablePointer(to: &embPtrPtr) { embPtrPtrPtr in
                         withUnsafeMutablePointer(to: &idPtrPtr) { idPtrPtrPtr in
                             withUnsafeMutablePointer(to: &scorePtrPtr) { scorePtrPtrPtr in

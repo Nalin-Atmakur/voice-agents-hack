@@ -197,7 +197,9 @@ actor CactusTacticalSummarizer: TacticalSummarizing {
 
     init(
         modelInitializationService: CactusModelInitializationService = .shared,
-        completeFunction: @escaping CompleteFunction = cactusComplete,
+        completeFunction: @escaping CompleteFunction = { model, messages, options, tools, onToken, pcm in
+            try cactusComplete(model, messages, options, tools, onToken, pcm)
+        },
         optionsJSON: String = #"{"max_tokens":96,"temperature":0.0}"#
     ) {
         self.modelInitializationService = modelInitializationService
@@ -369,7 +371,7 @@ actor CompactionEngine {
         messageRouter: MessageRouter = MessageRouter(),
         summarizer: any TacticalSummarizing = CactusTacticalSummarizer(),
         configuration: Configuration = Configuration(),
-        now: @escaping @Sendable () -> Date = Date.init,
+        now: @escaping @Sendable () -> Date = { Date() },
         sleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
         }
@@ -945,7 +947,7 @@ final class AVAudioEngineRecorder: NSObject, AudioCapturing, @unchecked Sendable
         do {
             // .voiceChat enables proper mic gain + echo cancellation for speech input.
             // .measurement was wrong — it disables hardware gain, causing near-zero amplitude.
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true)
             NSLog("[Audio] Session category set to playAndRecord/voiceChat — input available: %@, gain: %.2f",
                   session.isInputAvailable ? "yes" : "no", session.inputGain)
