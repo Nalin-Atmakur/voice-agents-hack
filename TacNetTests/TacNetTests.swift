@@ -2236,6 +2236,62 @@ final class TacNetTests: XCTestCase {
         XCTAssertTrue(transport.sentPackets.isEmpty, "No message should be sent while disconnected")
     }
 
+    // MARK: PTT gesture dispatcher
+
+    /// Regression for the real-device bug where pressing and holding the PTT button did not
+    /// dispatch to `MainViewModel.startPushToTalk` / `stopPushToTalk` (iOS reported
+    /// `Gesture: System gesture gate timed out.`). We now drive press/release transitions
+    /// through a `PTTPressDispatcher` that the `PTTButtonStyle` uses to dedupe SwiftUI's
+    /// repeated `configuration.isPressed` notifications. This test verifies that the
+    /// dispatcher wires onPressBegan / onPressEnded exactly once per physical press.
+    @MainActor
+    func testPTTPressDispatcherFiresOnPressBeganAndOnPressEndedExactlyOncePerPress() {
+        var beganCount = 0
+        var endedCount = 0
+        let dispatcher = PTTPressDispatcher(
+            onPressBegan: { beganCount += 1 },
+            onPressEnded: { endedCount += 1 }
+        )
+
+        // Initial state: no press in progress.
+        XCTAssertFalse(dispatcher.isPressed)
+        XCTAssertEqual(beganCount, 0)
+        XCTAssertEqual(endedCount, 0)
+
+        // Single transition to pressed fires onPressBegan exactly once.
+        dispatcher.updatePressState(isPressed: true)
+        XCTAssertTrue(dispatcher.isPressed)
+        XCTAssertEqual(beganCount, 1)
+        XCTAssertEqual(endedCount, 0)
+
+        // Repeated `true` deliveries must NOT re-fire onPressBegan (SwiftUI can
+        // redeliver `isPressed=true` during body refreshes).
+        dispatcher.updatePressState(isPressed: true)
+        dispatcher.updatePressState(isPressed: true)
+        XCTAssertEqual(beganCount, 1, "onPressBegan must fire only once per physical press")
+        XCTAssertEqual(endedCount, 0)
+
+        // Transition to released fires onPressEnded exactly once.
+        dispatcher.updatePressState(isPressed: false)
+        XCTAssertFalse(dispatcher.isPressed)
+        XCTAssertEqual(beganCount, 1)
+        XCTAssertEqual(endedCount, 1)
+
+        // Repeated `false` deliveries must NOT re-fire onPressEnded.
+        dispatcher.updatePressState(isPressed: false)
+        dispatcher.updatePressState(isPressed: false)
+        XCTAssertEqual(beganCount, 1)
+        XCTAssertEqual(endedCount, 1, "onPressEnded must fire only once per physical release")
+
+        // A second press/release cycle produces a second pair of exactly-one events.
+        dispatcher.updatePressState(isPressed: true)
+        XCTAssertEqual(beganCount, 2)
+        XCTAssertEqual(endedCount, 1)
+        dispatcher.updatePressState(isPressed: false)
+        XCTAssertEqual(beganCount, 2)
+        XCTAssertEqual(endedCount, 2)
+    }
+
     @MainActor
     func testAfterActionReviewStoreRoundTripPersistsBroadcastAndCompactionMetadata() throws {
         guard #available(iOS 17.0, *) else {

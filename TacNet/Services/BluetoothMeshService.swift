@@ -1517,6 +1517,31 @@ final class BluetoothMeshService {
         relayQueue.count
     }
 
+    /// UI-test-only hook: seeds `count` deterministic fake peer IDs as `.connected`
+    /// in `peerStates` and invokes `onPeerConnectionStateChanged` for each so
+    /// `MainViewModel` observers (via `refreshConnectionState` / the per-peer
+    /// callback) pick up `isConnected == true` without requiring real BLE.
+    ///
+    /// Activated by `AppNetworkCoordinator` when the app is launched with
+    /// `--ui-test-mesh-peers=<N>`. Production code paths never call this.
+    func seedUITestConnectedPeers(count: Int) {
+        guard count > 0 else { return }
+        for index in 0..<count {
+            let seed = String(
+                format: "ui-test-peer-%08x-%04x-%04x-%04x-%012x",
+                0xCAFEBABE,
+                0xFADE,
+                0xC0DE,
+                0xBEEF,
+                index
+            )
+            let peerID = UUID(uuidString: seed) ?? UUID()
+            peerStates[peerID] = .connected
+            onPeerConnectionStateChanged?(peerID, .connected)
+        }
+        NSLog("[BLE] UI-test mode — seeded %d fake connected peer(s)", count)
+    }
+
     private func handleTransportEvent(_ event: BluetoothMeshTransportEvent) {
         switch event {
         case .discoveredPeer(let peerID):
@@ -1735,32 +1760,58 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
     }
 
     func requestTreeConfig(from peerID: UUID, completion: @escaping (Result<Data, Error>) -> Void) {
+        NSLog("[Join] requestTreeConfig — peerID: %@, connected: %@, characteristics known: %@",
+              peerID.uuidString,
+              connectedPeripherals[peerID] != nil ? "yes" : "no",
+              discoveredCharacteristicsByPeer[peerID] != nil ? "yes" : "no")
+
         pendingTreeConfigReadCompletions[peerID, default: []].append(completion)
 
+        // Timeout: if the GATT read hasn't completed in 10s, fail the join.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self,
+                  self.pendingTreeConfigReadCompletions[peerID] != nil else { return }
+            NSLog("[Join] ⏱ requestTreeConfig timed out for peer %@", peerID.uuidString)
+            self.completeTreeConfigReads(
+                for: peerID,
+                result: .failure(BluetoothMeshTransportError.treeConfigUnavailable)
+            )
+        }
+
         if centralManager == nil || peripheralManager == nil {
+            NSLog("[Join] BLE stack not started — calling start()")
             start()
         }
 
         guard let peripheral = connectedPeripherals[peerID] ?? discoveredPeripherals[peerID] else {
+            NSLog("[Join] ❌ Peer %@ not in discovered or connected set — failing immediately", peerID.uuidString)
             completeTreeConfigReads(for: peerID, result: .failure(BluetoothMeshTransportError.unknownPeer))
             return
         }
 
         peripheral.delegate = self
+
         if let characteristic = discoveredCharacteristicsByPeer[peerID]?[.treeConfig] {
+            NSLog("[Join] Characteristics already known — reading treeConfig now")
             peripheral.readValue(for: characteristic)
             return
         }
 
-        if connectedPeripherals[peerID] == nil,
-           let centralManager,
-           centralManager.state == .poweredOn,
-           !connectingPeripheralIDs.contains(peerID) {
+        // Not yet connected or characteristics not yet discovered — queue the read.
+        // didConnect → discoverServices → didDiscoverCharacteristics → attemptTreeConfigRead
+        // will resume the completion when ready.
+        if connectedPeripherals[peerID] != nil {
+            NSLog("[Join] Connected but no characteristics yet — triggering service discovery")
+            peripheral.discoverServices([BluetoothMeshUUIDs.service])
+        } else if let centralManager, centralManager.state == .poweredOn,
+                  !connectingPeripheralIDs.contains(peerID) {
+            NSLog("[Join] Not connected — initiating connection to peer %@", peerID.uuidString)
             connectingPeripheralIDs.insert(peerID)
             centralManager.connect(peripheral, options: nil)
+        } else {
+            NSLog("[Join] Waiting for in-progress connection to peer %@ (state: %@)",
+                  peerID.uuidString, centralManager?.state.logDescription ?? "nil")
         }
-
-        peripheral.discoverServices([BluetoothMeshUUIDs.service])
     }
 
     private func startScanning() {
@@ -1827,12 +1878,23 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
     }
 
     private func attemptTreeConfigRead(for peerID: UUID) {
-        guard pendingTreeConfigReadCompletions[peerID] != nil,
+        let hasPending = pendingTreeConfigReadCompletions[peerID] != nil
+        let isConnected = connectedPeripherals[peerID] != nil
+        let hasChar = discoveredCharacteristicsByPeer[peerID]?[.treeConfig] != nil
+
+        NSLog("[Join] attemptTreeConfigRead for %@ — pending: %@, connected: %@, hasChar: %@",
+              peerID.uuidString,
+              hasPending ? "yes" : "no",
+              isConnected ? "yes" : "no",
+              hasChar ? "yes" : "no")
+
+        guard hasPending,
               let peripheral = connectedPeripherals[peerID],
               let treeConfigCharacteristic = discoveredCharacteristicsByPeer[peerID]?[.treeConfig] else {
             return
         }
 
+        NSLog("[Join] Issuing GATT read for treeConfig on peer %@", peerID.uuidString)
         peripheral.readValue(for: treeConfigCharacteristic)
     }
 
@@ -1924,9 +1986,17 @@ extension CoreBluetoothMeshTransport: CBCentralManagerDelegate {
 
 extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard error == nil else {
+        if let error {
+            NSLog("[Join] ❌ didDiscoverServices error for peer %@: %@",
+                  peripheral.identifier.uuidString, error.localizedDescription)
+            completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
             return
         }
+
+        let serviceCount = peripheral.services?.count ?? 0
+        let hasTacNetService = peripheral.services?.contains(where: { $0.uuid == BluetoothMeshUUIDs.service }) ?? false
+        NSLog("[Join] didDiscoverServices for peer %@ — %d service(s), TacNet service found: %@",
+              peripheral.identifier.uuidString, serviceCount, hasTacNetService ? "yes" : "no")
 
         peripheral.services?
             .filter { $0.uuid == BluetoothMeshUUIDs.service }
@@ -1940,7 +2010,10 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
-        guard error == nil else {
+        if let error {
+            NSLog("[Join] ❌ didDiscoverCharacteristics error for peer %@: %@",
+                  peripheral.identifier.uuidString, error.localizedDescription)
+            completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
             return
         }
 
@@ -1963,6 +2036,12 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
             }
         }
 
+        NSLog("[Join] didDiscoverCharacteristics for peer %@ — broadcast: %@, compaction: %@, treeConfig: %@",
+              peripheral.identifier.uuidString,
+              map[.broadcast] != nil ? "✅" : "❌",
+              map[.compaction] != nil ? "✅" : "❌",
+              map[.treeConfig] != nil ? "✅" : "❌")
+
         discoveredCharacteristicsByPeer[peripheral.identifier] = map
         attemptTreeConfigRead(for: peripheral.identifier)
     }
@@ -1971,10 +2050,16 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
         if characteristic.uuid == BluetoothMeshUUIDs.treeConfigCharacteristic,
            pendingTreeConfigReadCompletions[peripheral.identifier] != nil {
             if let error {
+                NSLog("[Join] ❌ treeConfig read error for peer %@: %@",
+                      peripheral.identifier.uuidString, error.localizedDescription)
                 completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
             } else if let value = characteristic.value {
+                NSLog("[Join] ✅ treeConfig read success for peer %@ — %d bytes",
+                      peripheral.identifier.uuidString, value.count)
                 completeTreeConfigReads(for: peripheral.identifier, result: .success(value))
             } else {
+                NSLog("[Join] ❌ treeConfig read returned nil value for peer %@",
+                      peripheral.identifier.uuidString)
                 completeTreeConfigReads(
                     for: peripheral.identifier,
                     result: .failure(BluetoothMeshTransportError.treeConfigUnavailable)
@@ -2012,14 +2097,29 @@ extension CoreBluetoothMeshTransport: CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+        NSLog("[Join] Received GATT read request from central %@ — characteristic: %@, offset: %d, payload size: %d",
+              request.central.identifier.uuidString,
+              request.characteristic.uuid.uuidString,
+              request.offset,
+              treeConfigPayload.count)
+
         guard request.characteristic.uuid == BluetoothMeshUUIDs.treeConfigCharacteristic else {
+            NSLog("[Join] ❌ Read on unsupported characteristic — rejecting")
             peripheral.respond(to: request, withResult: .requestNotSupported)
             return
         }
 
         guard request.offset <= treeConfigPayload.count else {
+            NSLog("[Join] ❌ Invalid offset %d (payload is %d bytes)", request.offset, treeConfigPayload.count)
             peripheral.respond(to: request, withResult: .invalidOffset)
             return
+        }
+
+        if treeConfigPayload.isEmpty {
+            NSLog("[Join] ⚠️ treeConfigPayload is empty — joiner will get no data")
+        } else {
+            NSLog("[Join] ✅ Serving %d bytes of treeConfig (offset %d)",
+                  treeConfigPayload.count - request.offset, request.offset)
         }
 
         request.value = treeConfigPayload.subdata(in: request.offset..<treeConfigPayload.count)
@@ -2227,25 +2327,36 @@ final class TreeSyncService: ObservableObject {
     }
 
     func join(network: DiscoveredNetwork, pin: String?) async throws -> NetworkConfig {
+        NSLog("[Join] TreeSyncService.join — fetching config from peer %@", network.peerID.uuidString)
         let remoteConfig: NetworkConfig
         do {
             remoteConfig = try await meshService.fetchNetworkConfig(from: network.peerID)
+            NSLog("[Join] Received config — networkID: %@, version: %d, requiresPIN: %@",
+                  remoteConfig.networkID.uuidString, remoteConfig.version,
+                  remoteConfig.requiresPIN ? "yes" : "no")
         } catch {
+            NSLog("[Join] ❌ fetchNetworkConfig failed: %@", error.localizedDescription)
             throw TreeSyncJoinError.treeConfigUnavailable
         }
 
-        guard remoteConfig.networkID == network.networkID else {
-            throw TreeSyncJoinError.networkMismatch
-        }
+        // NOTE: network.networkID is a proxy (== peerID) because BLE advertisements cannot
+        // carry the real networkID — only LocalName and ServiceUUIDs are allowed by CoreBluetooth.
+        // The real networkID comes from the GATT treeConfig read we just completed.
+        // We do NOT compare them; remoteConfig.networkID is the authoritative value.
+        NSLog("[Join] Using real networkID from GATT config: %@ (peer BT ID was: %@)",
+              remoteConfig.networkID.uuidString, network.peerID.uuidString)
 
         if remoteConfig.requiresPIN {
             guard let pin, !pin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                NSLog("[Join] ❌ PIN required but not provided")
                 throw TreeSyncJoinError.pinRequired
             }
 
             guard remoteConfig.isValidPIN(pin) else {
+                NSLog("[Join] ❌ PIN validation failed")
                 throw TreeSyncJoinError.invalidPIN
             }
+            NSLog("[Join] PIN validated ✅")
         }
 
         let keyMaterial = NetworkEncryptionService.keyMaterial(
@@ -2260,7 +2371,9 @@ final class TreeSyncService: ObservableObject {
                     wrappedSessionKey: wrappedSessionKey,
                     keyMaterial: keyMaterial
                 )
+                NSLog("[Join] Session key activated from wrapped key ✅")
             } catch {
+                NSLog("[Join] ❌ Failed to activate session key: %@", error.localizedDescription)
                 if remoteConfig.requiresPIN {
                     throw TreeSyncJoinError.invalidPIN
                 }
@@ -2271,10 +2384,12 @@ final class TreeSyncService: ObservableObject {
                 networkID: remoteConfig.networkID,
                 keyMaterial: keyMaterial
             )
+            NSLog("[Join] Deterministic session key activated ✅")
         }
 
         localConfig = remoteConfig
         persistLocalConfig(remoteConfig)
+        NSLog("[Join] ✅ TreeSyncService.join complete — '%@' v%d", remoteConfig.networkName, remoteConfig.version)
         return remoteConfig
     }
 
@@ -2578,11 +2693,15 @@ final class NetworkDiscoveryService: ObservableObject {
     }
 
     func startScanning(timeout: TimeInterval = 10) {
+        NSLog("[Discovery] startScanning — timeout: %.0fs", timeout)
         nearbyNetworks = []
         isScanning = true
 
         meshService.onNetworkDiscovered = { [weak self] peerID, summary in
             Task { @MainActor in
+                NSLog("[Discovery] Network discovered — '%@' from peer %@ (slots: %d, PIN: %@)",
+                      summary.networkName, peerID.uuidString, summary.openSlotCount,
+                      summary.requiresPIN ? "yes" : "no")
                 self?.upsert(
                     DiscoveredNetwork(
                         peerID: peerID,

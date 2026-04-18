@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import OSLog
 import UniformTypeIdentifiers
 
 /// Small bundle of launch-argument-driven flags used by XCUITest to drive the app
@@ -42,11 +43,115 @@ enum UITestMode {
         value(forPrefix: "--ui-test-role=")
     }
 
+    /// Passing `--ui-test-capture-logs` activates an in-app log buffer that records
+    /// every `[PTT]` NSLog emission and scans the unified logging system for system-
+    /// generated gesture-arbitration diagnostics (`Gesture: System gesture gate timed
+    /// out.`). The buffer's contents are exposed via the
+    /// `tacnet.debug.logBuffer` accessibility identifier on the Main tab so the real
+    /// SwiftUI Main tab can be driven by XCUITest and the console evidence required by
+    /// VAL-PTT-002 / VAL-PTT-003 can be harvested without requiring `xcrun simctl
+    /// spawn log stream` (which is unavailable to iOS XCUITest processes).
+    static var captureLogs: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-capture-logs")
+    }
+
+    /// Passing `--ui-test-mesh-peers=<N>` seeds `BluetoothMeshService` with N fake
+    /// connected peer IDs at boot so the real `MainViewModel` takes the connected-path
+    /// (happy) branch when PTT is pressed, without requiring real BLE. A value of `0`
+    /// (or omission) preserves the disconnected-path (gated) branch. Production-code
+    /// untouched; only the UI-test seeding helper activates.
+    static var meshPeerCount: Int {
+        guard let raw = value(forPrefix: "--ui-test-mesh-peers="),
+              let count = Int(raw),
+              count >= 0 else {
+            return 0
+        }
+        return count
+    }
+
     private static func value(forPrefix prefix: String) -> String? {
         for arg in ProcessInfo.processInfo.arguments where arg.hasPrefix(prefix) {
             return String(arg.dropFirst(prefix.count))
         }
         return nil
+    }
+}
+
+/// In-app log capture used ONLY when the app is launched with
+/// `--ui-test-capture-logs` by an XCUITest. Collects every `[PTT]` line emitted by
+/// `pttLog(_:)` and (on demand) scans the unified logging system for UIKit-generated
+/// `Gesture: System gesture gate timed out.` messages, which appear when SwiftUI's
+/// gesture arbitration loses the PTT long-press to an ancestor recognizer (tab swipe
+/// / nav back-edge / scroll). The buffer contents are exposed via a SwiftUI `Text`
+/// with accessibility identifier `tacnet.debug.logBuffer`, and a `Button` with
+/// identifier `tacnet.debug.refreshLogBuffer` forces a fresh OSLog scan so XCUITest
+/// can read the post-interaction snapshot deterministically.
+@MainActor
+final class UITestLogCapture: ObservableObject {
+    static let shared = UITestLogCapture()
+
+    /// Distinct prefix used for system-sourced log lines harvested from OSLogStore so
+    /// XCUITest can differentiate them from `pttLog(_:)` app-emitted lines.
+    static let systemLinePrefix = "[SYSTEM]"
+
+    private let startDate = Date()
+
+    @Published private(set) var lines: [String] = []
+
+    func append(_ line: String) {
+        lines.append(line)
+    }
+
+    var snapshotText: String {
+        if lines.isEmpty { return "(empty)" }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Scans the unified logging system for entries emitted in the current process
+    /// since capture began, specifically looking for iOS gesture-arbitration timeout
+    /// diagnostics. Any matches are appended (deduplicated) to the buffer. Best-effort
+    /// — `OSLogStore` requires iOS 15+ and can fail if the process lacks log-read
+    /// permission; on failure the buffer simply remains unchanged.
+    func scanSystemLog() {
+        guard #available(iOS 15.0, *) else { return }
+        do {
+            let store = try OSLogStore(scope: .currentProcessIdentifier)
+            let position = store.position(date: startDate)
+            let entries = try store.getEntries(at: position)
+            for case let entry as OSLogEntryLog in entries {
+                let composed = entry.composedMessage
+                if composed.contains("Gesture: System gesture gate timed out") {
+                    let annotated = "\(Self.systemLinePrefix) \(composed)"
+                    if !lines.contains(annotated) {
+                        lines.append(annotated)
+                    }
+                }
+            }
+        } catch {
+            // Best-effort; OSLogStore may be unavailable in some simulator runs.
+        }
+    }
+
+    /// For XCUITest teardown / reset between tests within a single process.
+    func reset() {
+        lines.removeAll()
+    }
+}
+
+/// Emit a `[PTT]`-prefixed log line via `NSLog` (preserved for on-device debugging —
+/// see Mission Boundaries) and, when the app is running under
+/// `--ui-test-capture-logs`, also append the literal line to
+/// `UITestLogCapture.shared` so XCUITest can read the captured console as
+/// accessibility-exposed text without needing host-side log streaming.
+///
+/// Production behaviour when not under UI-test capture: byte-for-byte identical to
+/// the pre-existing `NSLog("[PTT] …")` call sites.
+func pttLog(_ message: String) {
+    NSLog("%@", message)
+    if UITestMode.captureLogs {
+        Task { @MainActor in
+            UITestLogCapture.shared.append(message)
+        }
     }
 }
 
@@ -213,10 +318,50 @@ private struct UITestRouteHost: View {
             UITestPinEntryHost()
         case "settings":
             UITestSettingsHost(role: UITestMode.role ?? "participant")
+        case "main-ptt":
+            UITestMainPTTHost()
         default:
             Text("Unknown UI test route: \(route)")
                 .accessibilityIdentifier("tacnet.uiTestRoute.unknown")
         }
+    }
+}
+
+/// Hosts a stripped-down `PTTButton` wired to on-screen counters so XCUITest can verify
+/// that press/release gestures dispatch exactly once per physical press, without depending
+/// on a real `MainViewModel`, mesh service, or audio capture. Triggered via
+/// `--ui-test-route=main-ptt`. The counters are published as distinct accessibility
+/// identifiers (`tacnet.main.pttDebugBegan`, `tacnet.main.pttDebugEnded`) so assertions can
+/// read them directly.
+private struct UITestMainPTTHost: View {
+    @State private var pressBeganCount: Int = 0
+    @State private var pressEndedCount: Int = 0
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Began:\(pressBeganCount)")
+                .accessibilityIdentifier("tacnet.main.pttDebugBegan")
+            Text("Ended:\(pressEndedCount)")
+                .accessibilityIdentifier("tacnet.main.pttDebugEnded")
+
+            PTTButton(
+                title: "Hold to Talk",
+                symbol: "mic.fill",
+                color: .blue,
+                isInteractionDisabled: false,
+                isVisuallyDimmed: false,
+                onPressBegan: {
+                    pressBeganCount += 1
+                    NSLog("[PTT] UITest host press-began count=%d", pressBeganCount)
+                },
+                onPressEnded: {
+                    pressEndedCount += 1
+                    NSLog("[PTT] UITest host press-ended count=%d", pressEndedCount)
+                }
+            )
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("tacnet.uiTestRoute.mainPTT.root")
     }
 }
 
@@ -713,6 +858,8 @@ private struct JoinNetworkFlowView: View {
             } else {
                 NetworkScanView(
                     discoveryService: discoveryService,
+                    isJoining: isJoining,
+                    joinErrorMessage: joinErrorMessage,
                     onSelectNetwork: handleNetworkSelection,
                     onBack: onBack
                 )
@@ -784,8 +931,12 @@ private struct JoinNetworkFlowView: View {
 
     private func handleNetworkSelection(_ network: DiscoveredNetwork) {
         joinErrorMessage = nil
+        NSLog("[Join] Tapped network '%@' (peerID: %@, requiresPIN: %@)",
+              network.networkName, network.peerID.uuidString,
+              network.requiresPIN ? "yes" : "no")
 
         if network.requiresPIN {
+            NSLog("[Join] PIN required — showing PIN entry")
             selectedPINNetwork = network
             pinDraft = ""
             return
@@ -798,14 +949,21 @@ private struct JoinNetworkFlowView: View {
 
     private func join(network: DiscoveredNetwork, pin: String?) async {
         guard !isJoining else {
+            NSLog("[Join] ⚠️ join() called while already joining — ignored")
             return
         }
 
+        NSLog("[Join] Starting join for network '%@' (peerID: %@, pin: %@)",
+              network.networkName, network.peerID.uuidString,
+              pin == nil ? "none" : "provided")
         isJoining = true
         defer { isJoining = false }
 
         do {
+            NSLog("[Join] Fetching tree config via GATT from peer %@…", network.peerID.uuidString)
             let joined = try await treeSyncService.join(network: network, pin: pin)
+            NSLog("[Join] ✅ Successfully joined '%@' (networkID: %@, version: %d)",
+                  joined.networkName, joined.networkID.uuidString, joined.version)
             if let onJoined {
                 onJoined(joined)
             } else {
@@ -815,8 +973,10 @@ private struct JoinNetworkFlowView: View {
             joinErrorMessage = nil
             discoveryService.stopScanning()
         } catch let error as TreeSyncJoinError {
+            NSLog("[Join] ❌ Join failed with TreeSyncJoinError: %@", String(describing: error))
             joinErrorMessage = joinErrorMessage(for: error)
         } catch {
+            NSLog("[Join] ❌ Join failed with error: %@", error.localizedDescription)
             joinErrorMessage = error.localizedDescription
         }
     }
@@ -846,63 +1006,102 @@ private struct JoinNetworkFlowView: View {
 
 private struct NetworkScanView: View {
     @ObservedObject var discoveryService: NetworkDiscoveryService
+    let isJoining: Bool
+    let joinErrorMessage: String?
     let onSelectNetwork: (DiscoveredNetwork) -> Void
     let onBack: () -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
-            if discoveryService.nearbyNetworks.isEmpty {
-                VStack(spacing: 8) {
-                    if discoveryService.isScanning {
-                        ProgressView()
+        ZStack {
+            VStack(spacing: 12) {
+                // Error banner — shown when a join attempt fails
+                if let errorMessage = joinErrorMessage {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                        Text(errorMessage)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.leading)
+                        Spacer()
                     }
-
-                    Text(discoveryService.isScanning ? "Scanning for nearby TacNet networks…" : "No networks found.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("tacnet.scan.emptyStateLabel")
+                    .padding(10)
+                    .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal)
+                    .accessibilityIdentifier("tacnet.scan.errorBanner")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityIdentifier("tacnet.scan.emptyState")
-            } else {
-                List(discoveryService.nearbyNetworks) { network in
-                    Button {
-                        onSelectNetwork(network)
-                    } label: {
-                        HStack(spacing: 12) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(network.networkName)
-                                    .font(.headline)
-                                    .foregroundStyle(.primary)
-                                Text("Open slots: \(network.openSlotCount)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
 
-                            Spacer()
-
-                            Image(systemName: network.requiresPIN ? "lock.fill" : "lock.open.fill")
-                                .foregroundStyle(network.requiresPIN ? .orange : .green)
+                if discoveryService.nearbyNetworks.isEmpty {
+                    VStack(spacing: 8) {
+                        if discoveryService.isScanning {
+                            ProgressView()
                         }
+
+                        Text(discoveryService.isScanning ? "Scanning for nearby TacNet networks…" : "No networks found.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("tacnet.scan.emptyStateLabel")
                     }
-                }
-                .listStyle(.plain)
-            }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("tacnet.scan.emptyState")
+                } else {
+                    List(discoveryService.nearbyNetworks) { network in
+                        Button {
+                            onSelectNetwork(network)
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(network.networkName)
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    Text("Open slots: \(network.openSlotCount)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
 
-            HStack(spacing: 12) {
-                Button("Rescan (10s)") {
-                    discoveryService.startScanning(timeout: 10)
-                }
-                .buttonStyle(.bordered)
-                .accessibilityIdentifier("tacnet.scan.rescanButton")
+                                Spacer()
 
-                Button("Back", action: onBack)
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("tacnet.scan.backButton")
+                                Image(systemName: network.requiresPIN ? "lock.fill" : "lock.open.fill")
+                                    .foregroundStyle(network.requiresPIN ? .orange : .green)
+                            }
+                        }
+                        .disabled(isJoining)
+                    }
+                    .listStyle(.plain)
+                }
+
+                HStack(spacing: 12) {
+                    Button("Rescan (10s)") {
+                        discoveryService.startScanning(timeout: 10)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isJoining)
+                    .accessibilityIdentifier("tacnet.scan.rescanButton")
+
+                    Button("Back", action: onBack)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isJoining)
+                        .accessibilityIdentifier("tacnet.scan.backButton")
+                }
+                .padding(.bottom, 8)
             }
-            .padding(.bottom, 8)
+            .padding(.horizontal)
+
+            // Joining overlay — covers the list while GATT fetch is in-flight
+            if isJoining {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                VStack(spacing: 14) {
+                    ProgressView()
+                        .scaleEffect(1.4)
+                    Text("Connecting…")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                }
+                .padding(28)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            }
         }
-        .padding(.horizontal)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tacnet.scan.root")
         .task {
@@ -2559,14 +2758,173 @@ private struct AfterActionReviewResultRow: View {
     }
 }
 
+/// Tracks press-in / press-out transitions from a SwiftUI `ButtonStyle.Configuration.isPressed`
+/// stream and dispatches exactly one `onPressBegan` per press and exactly one `onPressEnded`
+/// per release. De-duplicates redundant `isPressed` deliveries (SwiftUI occasionally re-renders
+/// the style's body with the same pressed value) so the push-to-talk handler pair fires once
+/// per physical press.
+///
+/// This type is exposed (internal) so the behavior can be unit-tested without instantiating
+/// SwiftUI's private gesture recognizer stack.
+@MainActor
+final class PTTPressDispatcher {
+    private var isCurrentlyPressed = false
+    private let onPressBegan: () -> Void
+    private let onPressEnded: () -> Void
+
+    init(
+        onPressBegan: @escaping () -> Void,
+        onPressEnded: @escaping () -> Void
+    ) {
+        self.onPressBegan = onPressBegan
+        self.onPressEnded = onPressEnded
+    }
+
+    /// Update the tracked press state. Call this whenever SwiftUI emits a new
+    /// `configuration.isPressed` value. The first transition to `true` fires `onPressBegan`
+    /// once; the first subsequent transition to `false` fires `onPressEnded` once.
+    func updatePressState(isPressed: Bool) {
+        if isPressed && !isCurrentlyPressed {
+            isCurrentlyPressed = true
+            onPressBegan()
+        } else if !isPressed && isCurrentlyPressed {
+            isCurrentlyPressed = false
+            onPressEnded()
+        }
+    }
+
+    /// Exposes the current press state for tests.
+    var isPressed: Bool {
+        isCurrentlyPressed
+    }
+}
+
+/// Canonical SwiftUI push-to-talk button style. Uses a real `Button` under the hood so the
+/// gesture recognizer participates correctly in SwiftUI's built-in gesture arbitration —
+/// unlike a bare `DragGesture(minimumDistance: 0)` attached via `.gesture()`, which loses
+/// arbitration to ancestor `TabView` horizontal-swipe and `NavigationStack` back-edge
+/// gestures and triggers the iOS `Gesture: System gesture gate timed out.` log.
+///
+/// The style observes `configuration.isPressed` and forwards begin/end edges to a
+/// `PTTPressDispatcher`, which then invokes the caller-provided handlers exactly once per
+/// physical press/release. Logs every dispatch with the `[PTT]` prefix to aid on-device
+/// debugging.
+struct PTTButtonStyle: ButtonStyle {
+    let tintColor: Color
+    let isVisuallyDimmed: Bool
+    let onPressBegan: () -> Void
+    let onPressEnded: () -> Void
+
+    func makeBody(configuration: Configuration) -> some View {
+        PTTButtonStyleBody(
+            configuration: configuration,
+            tintColor: tintColor,
+            isVisuallyDimmed: isVisuallyDimmed,
+            onPressBegan: onPressBegan,
+            onPressEnded: onPressEnded
+        )
+    }
+
+    private struct PTTButtonStyleBody: View {
+        let configuration: Configuration
+        let tintColor: Color
+        let isVisuallyDimmed: Bool
+        let onPressBegan: () -> Void
+        let onPressEnded: () -> Void
+
+        @State private var dispatcher: PTTPressDispatcher?
+
+        var body: some View {
+            configuration.label
+                .opacity(isVisuallyDimmed ? 0.55 : 1.0)
+                .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+                .onAppear {
+                    if dispatcher == nil {
+                        dispatcher = PTTPressDispatcher(
+                            onPressBegan: {
+                                pttLog("[PTT] Button press-began (gesture dispatched)")
+                                onPressBegan()
+                            },
+                            onPressEnded: {
+                                pttLog("[PTT] Button press-ended (gesture released)")
+                                onPressEnded()
+                            }
+                        )
+                    }
+                }
+                .onChange(of: configuration.isPressed) { _, nowPressed in
+                    dispatcher?.updatePressState(isPressed: nowPressed)
+                }
+        }
+    }
+}
+
+/// Circular push-to-talk control. Renders the visual state (title, symbol, tint) from the
+/// caller and wires press/release to `onPressBegan` / `onPressEnded`. Adds the
+/// `tacnet.main.pttButton` accessibility identifier so XCUITest can locate the real button
+/// and drive it with `press(forDuration:)`.
+struct PTTButton: View {
+    let title: String
+    let symbol: String
+    let color: Color
+    /// When `true` the button ignores interaction entirely (used while the view model is in
+    /// `.sending` state). Disconnected-from-mesh state is NOT modelled here — the view model
+    /// rejects the press itself so that the gated-path `[PTT]` log fires and the user
+    /// receives immediate feedback.
+    let isInteractionDisabled: Bool
+    let isVisuallyDimmed: Bool
+    let onPressBegan: () -> Void
+    let onPressEnded: () -> Void
+
+    var body: some View {
+        Button(action: { /* intentionally empty; long-press handled by ButtonStyle */ }) {
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.20))
+                    .overlay(
+                        Circle()
+                            .stroke(color, lineWidth: 3)
+                    )
+
+                VStack(spacing: 8) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 40, weight: .semibold))
+                        .foregroundStyle(color)
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                }
+            }
+            .frame(width: 220, height: 220)
+            .contentShape(Circle())
+        }
+        .buttonStyle(
+            PTTButtonStyle(
+                tintColor: color,
+                isVisuallyDimmed: isVisuallyDimmed,
+                onPressBegan: onPressBegan,
+                onPressEnded: onPressEnded
+            )
+        )
+        .disabled(isInteractionDisabled)
+        .accessibilityLabel(Text(title))
+        .accessibilityIdentifier("tacnet.main.pttButton")
+    }
+}
+
 private struct MainView: View {
     @ObservedObject var viewModel: MainViewModel
+    @ObservedObject private var logCapture = UITestLogCapture.shared
     let onBackToRoleSelection: () -> Void
-
-    @State private var isPressingPTT = false
 
     var body: some View {
         VStack(spacing: 14) {
+            if UITestMode.captureLogs {
+                pttDebugLogOverlay
+            }
             if let disconnectionMessage = viewModel.disconnectionMessage {
                 Label(disconnectionMessage, systemImage: "wifi.exclamationmark")
                     .font(.footnote)
@@ -2605,7 +2963,7 @@ private struct MainView: View {
 
             pttControl
                 .padding(.bottom, 12)
-                .accessibilityElement(children: .combine)
+                .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("tacnet.main.pttControl")
         }
         .navigationTitle("Main Feed")
@@ -2623,50 +2981,60 @@ private struct MainView: View {
     }
 
     private var pttControl: some View {
-        ZStack {
-            Circle()
-                .fill(viewModel.pttButtonColor.opacity(0.20))
-                .overlay(
-                    Circle()
-                        .stroke(viewModel.pttButtonColor, lineWidth: 3)
-                )
-
-            VStack(spacing: 8) {
-                Image(systemName: viewModel.pttButtonSymbol)
-                    .font(.system(size: 40, weight: .semibold))
-                    .foregroundStyle(viewModel.pttButtonColor)
-                Text(viewModel.pttButtonTitle)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 12)
+        PTTButton(
+            title: viewModel.pttButtonTitle,
+            symbol: viewModel.pttButtonSymbol,
+            color: viewModel.pttButtonColor,
+            // Only block interaction while transcribing/sending — disconnected presses must
+            // still dispatch so the gated-rejection `[PTT]` log surfaces user feedback.
+            isInteractionDisabled: viewModel.pttState == .sending,
+            isVisuallyDimmed: viewModel.isPTTDisabled,
+            onPressBegan: {
+                Task { @MainActor in
+                    await viewModel.startPushToTalk()
+                }
+            },
+            onPressEnded: {
+                Task { @MainActor in
+                    await viewModel.stopPushToTalk()
+                }
             }
-        }
-        .frame(width: 220, height: 220)
-        .opacity(viewModel.isPTTDisabled ? 0.55 : 1.0)
-        .contentShape(Circle())
-        .allowsHitTesting(!viewModel.isPTTDisabled || viewModel.pttState == .recording)
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in
-                    guard !isPressingPTT else {
-                        return
-                    }
-                    isPressingPTT = true
-                    Task {
-                        await viewModel.startPushToTalk()
-                    }
-                }
-                .onEnded { _ in
-                    guard isPressingPTT else {
-                        return
-                    }
-                    isPressingPTT = false
-                    Task {
-                        await viewModel.stopPushToTalk()
-                    }
-                }
         )
+    }
+
+    /// Hidden debug surface used ONLY when the app is launched with
+    /// `--ui-test-capture-logs` to support VAL-PTT-002 / VAL-PTT-003 on the real
+    /// Main tab. Exposes the captured `[PTT]` log buffer and a refresh button (which
+    /// forces `UITestLogCapture.shared` to pull fresh entries from `OSLogStore`).
+    /// The identifiers `tacnet.debug.logBuffer` and `tacnet.debug.refreshLogBuffer`
+    /// are read by XCUITest; the overlay is intentionally shown (not zero-framed)
+    /// so XCUITest can hit the refresh button reliably.
+    private var pttDebugLogOverlay: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("PTT Log Buffer (UI-test capture)")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ScrollView {
+                Text(logCapture.snapshotText)
+                    .font(.caption2.monospaced())
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("tacnet.debug.logBuffer")
+            }
+            .frame(height: 72)
+            .background(Color.secondary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Button {
+                logCapture.scanSystemLog()
+            } label: {
+                Text("Refresh PTT Log")
+                    .font(.caption2)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("tacnet.debug.refreshLogBuffer")
+        }
+        .padding(.horizontal)
     }
 }
 
@@ -2900,7 +3268,7 @@ final class MainViewModel: ObservableObject {
         }
 
         guard !meshService.connectedPeerIDs.isEmpty else {
-            NSLog("[PTT] ❌ Rejected — disconnected from mesh (0 connected peers)")
+            pttLog("[PTT] ❌ Rejected — disconnected from mesh (0 connected peers)")
             pttState = .idle
             errorMessage = Self.disconnectedErrorText
             isConnected = false
@@ -2908,19 +3276,19 @@ final class MainViewModel: ObservableObject {
         }
 
         guard localContext() != nil else {
-            NSLog("[PTT] ❌ No role claimed — cannot transmit")
+            pttLog("[PTT] ❌ No role claimed — cannot transmit")
             errorMessage = "Claim a role before transmitting."
             return
         }
 
-        NSLog("[PTT] Recording started (connected peers: %d)", meshService.connectedPeerIDs.count)
+        pttLog("[PTT] Recording started (connected peers: \(meshService.connectedPeerIDs.count))")
         do {
             try await audioService.pttPressed()
             pttState = .recording
             errorMessage = nil
         } catch {
             pttState = .idle
-            NSLog("[PTT] ❌ Failed to start recording: %@", error.localizedDescription)
+            pttLog("[PTT] ❌ Failed to start recording: \(error.localizedDescription)")
             errorMessage = "Unable to start recording: \(error.localizedDescription)"
         }
     }
@@ -2930,33 +3298,33 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        NSLog("[PTT] Recording stopped — transcribing…")
+        pttLog("[PTT] Recording stopped — transcribing…")
         pttState = .sending
 
         do {
             let queuedSequence = try await audioService.pttReleased()
             guard let queuedSequence else {
-                NSLog("[PTT] Silence detected — no speech found, discarding clip")
+                pttLog("[PTT] Silence detected — no speech found, discarding clip")
                 pttState = .idle
                 return
             }
 
-            NSLog("[PTT] Waiting for transcription (model may be loading on first use)…")
+            pttLog("[PTT] Waiting for transcription (model may be loading on first use)…")
             await audioService.waitForIdle()
             let history = await audioService.transcriptHistory
             guard let transcript = history.first(where: { $0.sequence == queuedSequence })?.transcript,
                   !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                NSLog("[PTT] Transcription produced empty result — discarding")
+                pttLog("[PTT] Transcription produced empty result — discarding")
                 pttState = .idle
                 return
             }
 
-            NSLog("[PTT] ✅ Transcript: \"%@\"", transcript)
+            pttLog("[PTT] ✅ Transcript: \"\(transcript)\"")
             publishLocalTranscript(transcript)
             pttState = .idle
         } catch {
             pttState = .idle
-            NSLog("[PTT] ❌ Error: %@", error.localizedDescription)
+            pttLog("[PTT] ❌ Error: \(error.localizedDescription)")
             errorMessage = "Unable to send message: \(error.localizedDescription)"
         }
     }
@@ -2975,9 +3343,9 @@ final class MainViewModel: ObservableObject {
             in: context.config.tree
         )
         let peers = meshService.connectedPeerIDs.count
-        NSLog("[PTT] Publishing broadcast from role '%@' → %d connected peer(s)", context.senderRole, peers)
+        pttLog("[PTT] Publishing broadcast from role '\(context.senderRole)' → \(peers) connected peer(s)")
         if peers == 0 {
-            NSLog("[PTT] No peers connected — message queued in relay, will send when peer joins")
+            pttLog("[PTT] No peers connected — message queued in relay, will send when peer joins")
         }
         meshService.publish(outboundMessage)
         onBroadcastPublished?(outboundMessage)
@@ -3165,6 +3533,15 @@ final class AppNetworkCoordinator: ObservableObject {
                 self?.mainViewModel.handlePeerConnectionStateChanged(peerID: peerID, state: state)
                 self?.treeViewModel.handlePeerConnectionStateChanged(peerID: peerID, state: state)
             }
+        }
+
+        // UI-test seeding: must come after both callbacks are wired so the MainViewModel
+        // observes the happy-path (connected) state. Production launches set
+        // `UITestMode.meshPeerCount == 0` and this is a no-op.
+        let seedCount = UITestMode.meshPeerCount
+        if seedCount > 0 {
+            meshService.seedUITestConnectedPeers(count: seedCount)
+            mainViewModel.refreshConnectionState()
         }
     }
 

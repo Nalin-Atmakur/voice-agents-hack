@@ -167,7 +167,6 @@
 			children = (
 				A05AC0E84E210EDC684F6E0B /* TacNetUITests.swift */,
 			);
-			name = TacNetUITests;
 			path = TacNetUITests;
 			sourceTree = "<group>";
 		};
@@ -250,7 +249,6 @@
 			isa = PBXGroup;
 			children = (
 			);
-			name = Screenshots;
 			path = Screenshots;
 			sourceTree = "<group>";
 		};

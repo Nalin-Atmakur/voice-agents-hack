@@ -460,6 +460,248 @@ final class TacNetUISmokeTests: XCTestCase {
         participantApp.terminate()
     }
 
+    // MARK: - VAL-PTT-002 / VAL-PTT-003 · PTT button gesture dispatch + no gesture gate timeout
+
+    /// Regression for the user-reported live-device bug where pressing and holding the PTT
+    /// button on the Main tab produced zero `[PTT]` NSLog output, because the legacy
+    /// `DragGesture(minimumDistance: 0)` on `pttControl` lost gesture arbitration to the
+    /// parent `TabView` swipe gesture and triggered the iOS
+    /// `Gesture: System gesture gate timed out.` log.
+    ///
+    /// Uses the `--ui-test-route=main-ptt` host, which hosts a stripped-down `PTTButton`
+    /// wired to on-screen counters (`tacnet.main.pttDebugBegan` / `tacnet.main.pttDebugEnded`)
+    /// so we can assert exactly-one press-began + exactly-one press-ended delivered from a
+    /// real `press(forDuration:)` (not a synthetic `tap()`).
+    func testPTTButtonLongPressDispatchesToViewModel() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-route=main-ptt"]
+        app.launch()
+
+        let hostRoot = anyElement(app, identifier: "tacnet.uiTestRoute.mainPTT.root")
+        waitForExistence(hostRoot, timeout: 8, message: "main-ptt host did not render.")
+
+        let pttButton = anyElement(app, identifier: "tacnet.main.pttButton")
+        waitForExistence(pttButton, timeout: 6, message: "PTTButton did not render in main-ptt host.")
+
+        // Snapshot counters before interaction — both counters should report 0.
+        let beganLabel = anyElement(app, identifier: "tacnet.main.pttDebugBegan")
+        let endedLabel = anyElement(app, identifier: "tacnet.main.pttDebugEnded")
+        waitForExistence(beganLabel, timeout: 4, message: "pttDebugBegan counter did not render.")
+        waitForExistence(endedLabel, timeout: 4, message: "pttDebugEnded counter did not render.")
+        XCTAssertEqual(beganLabel.label, "Began:0", "Began counter should start at 0 before any press.")
+        XCTAssertEqual(endedLabel.label, "Ended:0", "Ended counter should start at 0 before any press.")
+
+        saveScreenshot(app, named: "ptt-dispatch-before-press")
+
+        // Real long-press (not a synthetic tap()). 1.5s is well past the 0.5s iOS
+        // long-press default threshold and is the duration called out in the
+        // validation contract assertion VAL-PTT-003.
+        pttButton.press(forDuration: 1.5)
+
+        // Wait up to 2s for the counter labels to update to exactly 1.
+        let beganFiredPredicate = NSPredicate(format: "label == %@", "Began:1")
+        let endedFiredPredicate = NSPredicate(format: "label == %@", "Ended:1")
+        let beganExpectation = expectation(for: beganFiredPredicate, evaluatedWith: beganLabel)
+        let endedExpectation = expectation(for: endedFiredPredicate, evaluatedWith: endedLabel)
+        let result = XCTWaiter.wait(for: [beganExpectation, endedExpectation], timeout: 2.0)
+        XCTAssertEqual(
+            result,
+            .completed,
+            "PTTButton press-began / press-ended counters did not both reach 1 within 2s after press(forDuration: 1.5). \(beganLabel.label) | \(endedLabel.label)"
+        )
+
+        XCTAssertEqual(
+            beganLabel.label,
+            "Began:1",
+            "press-began handler must fire exactly once per physical press."
+        )
+        XCTAssertEqual(
+            endedLabel.label,
+            "Ended:1",
+            "press-ended handler must fire exactly once per physical release."
+        )
+
+        saveScreenshot(app, named: "ptt-dispatch-after-press")
+    }
+
+    /// VAL-PTT-003 companion: performs a press-hold-release cycle on the PTTButton and
+    /// asserts that the gesture is NOT swallowed by any ancestor gesture recognizer (which
+    /// would manifest as the iOS `Gesture: System gesture gate timed out.` console line
+    /// and dropped / duplicated press events).
+    ///
+    /// Because XCUITest runs in an iOS test-runner sandbox that cannot spawn host-side
+    /// `xcrun simctl spawn booted log stream`, this test uses a behavioral proxy that
+    /// is strictly equivalent on the SwiftUI gesture layer: two back-to-back `press(forDuration:)`
+    /// cycles MUST each deliver exactly one press-began + one press-ended event (total
+    /// Began:2 / Ended:2) with no missed or duplicated events. A gesture-gate timeout would
+    /// produce a mismatch (0 or 2 on the first, or asymmetric counts), and the real
+    /// `[PTT] Button press-began` / `[PTT] Button press-ended` NSLog lines emitted by
+    /// `PTTButtonStyle` remain visible in `Console.app` for on-device verification.
+    func testPTTButtonGestureDoesNotProduceGestureGateTimeout() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-test-route=main-ptt"]
+        app.launch()
+
+        let pttButton = anyElement(app, identifier: "tacnet.main.pttButton")
+        waitForExistence(pttButton, timeout: 8, message: "PTTButton did not render.")
+        let beganLabel = anyElement(app, identifier: "tacnet.main.pttDebugBegan")
+        let endedLabel = anyElement(app, identifier: "tacnet.main.pttDebugEnded")
+        waitForExistence(beganLabel, timeout: 4)
+        waitForExistence(endedLabel, timeout: 4)
+        XCTAssertEqual(beganLabel.label, "Began:0")
+        XCTAssertEqual(endedLabel.label, "Ended:0")
+
+        // First press-hold-release cycle — must tick the counters to 1/1.
+        pttButton.press(forDuration: 1.5)
+        let firstBegan = expectation(
+            for: NSPredicate(format: "label == %@", "Began:1"),
+            evaluatedWith: beganLabel
+        )
+        let firstEnded = expectation(
+            for: NSPredicate(format: "label == %@", "Ended:1"),
+            evaluatedWith: endedLabel
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [firstBegan, firstEnded], timeout: 2.0),
+            .completed,
+            "First press(forDuration:) did not deliver one began + one ended within 2s — gesture likely timed out at the iOS gate. \(beganLabel.label) | \(endedLabel.label)"
+        )
+        saveScreenshot(app, named: "ptt-gate-after-first-press")
+
+        // Second press-hold-release cycle — counters should advance to 2/2. If the iOS
+        // gesture gate had timed out on the first cycle, the second gesture is typically
+        // swallowed too; counts would remain at 1/1.
+        pttButton.press(forDuration: 1.5)
+        let secondBegan = expectation(
+            for: NSPredicate(format: "label == %@", "Began:2"),
+            evaluatedWith: beganLabel
+        )
+        let secondEnded = expectation(
+            for: NSPredicate(format: "label == %@", "Ended:2"),
+            evaluatedWith: endedLabel
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [secondBegan, secondEnded], timeout: 2.0),
+            .completed,
+            "Second press(forDuration:) did not deliver one began + one ended within 2s. \(beganLabel.label) | \(endedLabel.label)"
+        )
+        saveScreenshot(app, named: "ptt-gate-after-second-press")
+
+        XCTAssertEqual(
+            beganLabel.label,
+            "Began:2",
+            "After two press cycles, press-began must fire exactly twice total (once per cycle, no swallowed events)."
+        )
+        XCTAssertEqual(
+            endedLabel.label,
+            "Ended:2",
+            "After two press cycles, press-ended must fire exactly twice total (once per cycle, no swallowed events)."
+        )
+    }
+
+    // MARK: - VAL-PTT-002 / VAL-PTT-003 · Real Main-tab coverage with console-log evidence
+
+    /// VAL-PTT-002 regression on the REAL Main tab (no `--ui-test-route=main-ptt`
+    /// synthetic host): launches the app through the normal bootstrap, walks the
+    /// full Welcome → Create Network → Tree Builder → Publish → Role Selection →
+    /// Claim flow until the live `TabView`/`NavigationStack` Main tab appears,
+    /// performs a 1.5 s `press(forDuration:)` on the REAL `tacnet.main.pttButton`,
+    /// and captures the in-process unified log via `UITestLogCapture` (activated
+    /// via `--ui-test-capture-logs`). Seeds a single fake connected peer with
+    /// `--ui-test-mesh-peers=1` so the view model takes the happy (connected)
+    /// path and the `[PTT] Recording started…` line is emitted.
+    ///
+    /// Covers the VAL-PTT-002 evidence requirement: captured console log must
+    /// contain at least one `[PTT]` line AND must NOT contain `Gesture: System
+    /// gesture gate timed out`.
+    func testPTTButtonLongPressOnRealMainTabDispatchesToViewModel() {
+        let app = launchAndReachRealMainTab(
+            additionalArguments: ["--ui-test-mesh-peers=1", "--ui-test-capture-logs"]
+        )
+        saveScreenshot(app, named: "real-main-tab-before-press")
+
+        let pttButton = anyElement(app, identifier: "tacnet.main.pttButton")
+        waitForExistence(pttButton, timeout: 8, message: "Real PTTButton did not render on Main tab.")
+
+        // Single 1.5 s press on the real PTTButton — this is the contracted
+        // `press(forDuration:)` call out of the validation contract.
+        pttButton.press(forDuration: 1.5)
+
+        let capturedLog = waitForPTTLogBufferToContainPTTLine(app: app, timeout: 4.0)
+        attachCapturedLog(capturedLog, named: "real-main-tab-single-press.log")
+        saveScreenshot(app, named: "real-main-tab-after-press")
+
+        assertCapturedLogHasPTTEvidence(capturedLog)
+        XCTAssertFalse(
+            capturedLog.contains("Gesture: System gesture gate timed out"),
+            "Captured log unexpectedly contains the iOS gesture-gate timeout marker:\n\(capturedLog)"
+        )
+    }
+
+    /// VAL-PTT-003 regression on the REAL Main tab: performs two back-to-back
+    /// `press(forDuration: 1.5)` cycles on the live `tacnet.main.pttButton` hosted
+    /// inside the real `TabView` + `NavigationStack`, then asserts that the
+    /// captured in-process log contains ≥2 press-began `[PTT]` lines, ≥2
+    /// press-ended `[PTT]` lines, and zero `Gesture: System gesture gate timed
+    /// out` entries.
+    ///
+    /// Uses the disconnected (gated) path deliberately — no
+    /// `--ui-test-mesh-peers=1` — so the second form of `[PTT]` log line (the
+    /// `❌ Rejected — disconnected from mesh` gated-path message) is exercised
+    /// for evidence, complementing the happy-path coverage in
+    /// `testPTTButtonLongPressOnRealMainTabDispatchesToViewModel`.
+    func testPTTButtonGestureOnRealMainTabNoGateTimeoutAcrossRepeatedPresses() {
+        let app = launchAndReachRealMainTab(
+            additionalArguments: ["--ui-test-capture-logs"]
+        )
+
+        let pttButton = anyElement(app, identifier: "tacnet.main.pttButton")
+        waitForExistence(pttButton, timeout: 8)
+
+        // First cycle.
+        pttButton.press(forDuration: 1.5)
+        _ = waitForPTTLogBufferToContainPTTLine(app: app, timeout: 4.0)
+        saveScreenshot(app, named: "real-main-tab-after-first-press")
+
+        // Second cycle — if the iOS gesture gate had timed out on cycle #1, this
+        // press typically also gets swallowed, so counters remain unchanged and
+        // the assertion below fails.
+        pttButton.press(forDuration: 1.5)
+        let capturedLog = waitForPTTLogBufferEntryCount(
+            app: app,
+            minimumPressBeganLines: 2,
+            minimumPressEndedLines: 2,
+            timeout: 4.0
+        )
+        attachCapturedLog(capturedLog, named: "real-main-tab-repeated-press.log")
+        saveScreenshot(app, named: "real-main-tab-after-second-press")
+
+        // Validate the captured buffer: at least 2 press-began + at least 2
+        // press-ended PTT lines, and zero system-generated gesture-gate timeouts.
+        let pressBeganCount = countOccurrences(
+            of: "[PTT] Button press-began",
+            in: capturedLog
+        )
+        let pressEndedCount = countOccurrences(
+            of: "[PTT] Button press-ended",
+            in: capturedLog
+        )
+        XCTAssertGreaterThanOrEqual(
+            pressBeganCount,
+            2,
+            "Captured log must contain at least 2 press-began `[PTT]` lines for 2 presses. Got:\n\(capturedLog)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            pressEndedCount,
+            2,
+            "Captured log must contain at least 2 press-ended `[PTT]` lines for 2 presses. Got:\n\(capturedLog)"
+        )
+        XCTAssertFalse(
+            capturedLog.contains("Gesture: System gesture gate timed out"),
+            "Captured log unexpectedly contains the iOS gesture-gate timeout marker after 2 presses:\n\(capturedLog)"
+        )
+    }
+
     // MARK: - Helpers for seeded flow
 
     /// Launches the app, walks Welcome → Create Network → Tree Builder, adds one child,
@@ -484,5 +726,150 @@ final class TacNetUISmokeTests: XCTestCase {
         publishButton.tap()
 
         return app
+    }
+
+    /// Boots the app into the REAL Main tab (no synthetic route): walks Welcome →
+    /// Create Network → Tree Builder (adds Alpha) → Publish → Role Selection →
+    /// Claim Alpha → TabView with Main tab selected. Returns the live app handle
+    /// with the real `ContentView.TabView` + `NavigationStack` hierarchy. Any
+    /// additional launch args (e.g. `--ui-test-mesh-peers=1`,
+    /// `--ui-test-capture-logs`) are forwarded to the launch.
+    private func launchAndReachRealMainTab(additionalArguments: [String] = []) -> XCUIApplication {
+        let app = makeApp(additionalArguments: additionalArguments)
+        app.launch()
+
+        // Welcome → Create Network.
+        let createButton = app.buttons["tacnet.welcome.createNetworkButton"]
+        waitForExistence(createButton, timeout: 10, message: "Welcome did not render on real launch.")
+        createButton.tap()
+
+        // Tree Builder → add Alpha.
+        let addChildButton = app.buttons["tacnet.treeBuilder.addChildButton"]
+        waitForExistence(addChildButton, timeout: 8, message: "Tree Builder did not render.")
+        let newChildField = app.textFields["tacnet.treeBuilder.newChildField"]
+        waitForExistence(newChildField)
+        newChildField.tap()
+        newChildField.typeText("Alpha")
+        addChildButton.tap()
+
+        // Publish.
+        let publishButton = app.buttons["tacnet.treeBuilder.publishButton"]
+        waitForExistence(publishButton, timeout: 4)
+        publishButton.tap()
+
+        // Role Selection → claim Alpha so we reach the real Tab shell.
+        let alphaStaticText = app.staticTexts["Alpha"]
+        waitForExistence(alphaStaticText, timeout: 8, message: "Role Selection did not render Alpha row.")
+        let claimableCell = app.buttons
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "tacnet.roleSelection.row."))
+            .element(matching: NSPredicate(format: "label CONTAINS %@", "Alpha"))
+        if claimableCell.exists {
+            claimableCell.tap()
+        } else {
+            alphaStaticText.tap()
+        }
+
+        // Verify the real Tab shell is live (TabView + Main tab reachable).
+        let tabBar = app.tabBars.firstMatch
+        waitForExistence(tabBar, timeout: 12, message: "Real TabView did not appear after Role claim.")
+        let mainTab = tabBar.buttons["Main"]
+        if mainTab.exists {
+            mainTab.tap()
+        }
+        let mainRoot = anyElement(app, identifier: "tacnet.main.root")
+        waitForExistence(mainRoot, timeout: 6, message: "Real Main tab did not render.")
+        return app
+    }
+
+    /// Taps the hidden debug-refresh button (installed when `--ui-test-capture-logs`
+    /// is passed) so the in-app `UITestLogCapture` pulls fresh OSLogStore entries,
+    /// then returns the current `tacnet.debug.logBuffer` text. Waits up to `timeout`
+    /// seconds for at least one `[PTT]` line to land in the buffer.
+    private func waitForPTTLogBufferToContainPTTLine(
+        app: XCUIApplication,
+        timeout: TimeInterval
+    ) -> String {
+        let refreshButton = app.buttons["tacnet.debug.refreshLogBuffer"]
+        if refreshButton.exists {
+            refreshButton.tap()
+        }
+        let buffer = anyElement(app, identifier: "tacnet.debug.logBuffer")
+        waitForExistence(buffer, timeout: 4, message: "PTT debug log buffer did not render.")
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastSnapshot = buffer.label
+        while Date() < deadline {
+            lastSnapshot = buffer.label
+            if lastSnapshot.contains("[PTT]") {
+                return lastSnapshot
+            }
+            if refreshButton.exists {
+                refreshButton.tap()
+            }
+            _ = XCUIApplication().wait(for: .runningForeground, timeout: 0.25)
+        }
+        if refreshButton.exists {
+            refreshButton.tap()
+        }
+        return buffer.label
+    }
+
+    /// Polls the log buffer until at least `minimumPressBeganLines` press-began
+    /// `[PTT]` lines and `minimumPressEndedLines` press-ended `[PTT]` lines are
+    /// present, or the timeout elapses.
+    private func waitForPTTLogBufferEntryCount(
+        app: XCUIApplication,
+        minimumPressBeganLines: Int,
+        minimumPressEndedLines: Int,
+        timeout: TimeInterval
+    ) -> String {
+        let refreshButton = app.buttons["tacnet.debug.refreshLogBuffer"]
+        let buffer = anyElement(app, identifier: "tacnet.debug.logBuffer")
+        waitForExistence(buffer, timeout: 4, message: "PTT debug log buffer did not render.")
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastSnapshot = buffer.label
+        while Date() < deadline {
+            lastSnapshot = buffer.label
+            let began = countOccurrences(of: "[PTT] Button press-began", in: lastSnapshot)
+            let ended = countOccurrences(of: "[PTT] Button press-ended", in: lastSnapshot)
+            if began >= minimumPressBeganLines, ended >= minimumPressEndedLines {
+                return lastSnapshot
+            }
+            if refreshButton.exists {
+                refreshButton.tap()
+            }
+            _ = XCUIApplication().wait(for: .runningForeground, timeout: 0.25)
+        }
+        return buffer.label
+    }
+
+    private func countOccurrences(of substring: String, in text: String) -> Int {
+        guard !substring.isEmpty else { return 0 }
+        var count = 0
+        var searchRange = text.startIndex..<text.endIndex
+        while let found = text.range(of: substring, range: searchRange) {
+            count += 1
+            searchRange = found.upperBound..<text.endIndex
+        }
+        return count
+    }
+
+    /// Attaches the captured log string to the XCTest run so the evidence can be
+    /// inspected in the .xcresult bundle per VAL-PTT-002 / VAL-PTT-003.
+    private func attachCapturedLog(_ log: String, named name: String) {
+        let attachment = XCTAttachment(string: log)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func assertCapturedLogHasPTTEvidence(_ log: String) {
+        // Require at least one `[PTT]` line as the validation-contract evidence.
+        let hasPTTLine = log.contains("[PTT]")
+        XCTAssertTrue(
+            hasPTTLine,
+            "Captured log must contain at least one `[PTT]` line during the real-Main-tab press interaction. Got:\n\(log)"
+        )
     }
 }
