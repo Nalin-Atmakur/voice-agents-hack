@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import CoreBluetooth
 
 struct BluetoothMeshUUIDs {
@@ -13,8 +14,114 @@ enum PeerConnectionState: String, Equatable, Sendable {
     case disconnected
 }
 
+struct NetworkAdvertisement: Equatable, Sendable {
+    let networkID: UUID
+    let networkName: String
+    let openSlotCount: Int
+    let requiresPIN: Bool
+
+    init(networkID: UUID, networkName: String, openSlotCount: Int, requiresPIN: Bool) {
+        self.networkID = networkID
+        self.networkName = networkName
+        self.openSlotCount = max(0, openSlotCount)
+        self.requiresPIN = requiresPIN
+    }
+
+    init(from config: NetworkConfig) {
+        self.init(
+            networkID: config.networkID,
+            networkName: config.networkName,
+            openSlotCount: config.openSlotCount,
+            requiresPIN: config.requiresPIN
+        )
+    }
+}
+
+struct DiscoveredNetwork: Identifiable, Equatable, Sendable {
+    var id: UUID { peerID }
+    let peerID: UUID
+    let networkID: UUID
+    let networkName: String
+    let openSlotCount: Int
+    let requiresPIN: Bool
+}
+
+private enum NetworkAdvertisementCodec {
+    private static let schemaVersion: UInt8 = 1
+    private static let requiresPINFlag: UInt8 = 1 << 0
+    private static let payloadLength = 20
+    private static let maxAdvertisedNameLength = 20
+
+    static func advertisingData(for summary: NetworkAdvertisement) -> [String: Any] {
+        let clampedOpenSlots = UInt16(max(0, min(summary.openSlotCount, Int(UInt16.max))))
+        var payload = Data(capacity: payloadLength)
+        payload.append(schemaVersion)
+        payload.append(summary.requiresPIN ? requiresPINFlag : 0)
+        payload.append(UInt8((clampedOpenSlots >> 8) & 0xFF))
+        payload.append(UInt8(clampedOpenSlots & 0xFF))
+        payload.append(uuidData(summary.networkID))
+
+        let advertisedName = String(summary.networkName.prefix(maxAdvertisedNameLength))
+        return [
+            CBAdvertisementDataServiceUUIDsKey: [BluetoothMeshUUIDs.service],
+            CBAdvertisementDataLocalNameKey: advertisedName,
+            CBAdvertisementDataServiceDataKey: [BluetoothMeshUUIDs.service: payload]
+        ]
+    }
+
+    static func decode(advertisementData: [String: Any]) -> NetworkAdvertisement? {
+        guard let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
+              let payload = serviceData[BluetoothMeshUUIDs.service],
+              payload.count >= payloadLength,
+              payload[0] == schemaVersion else {
+            return nil
+        }
+
+        let flags = payload[1]
+        let openSlotCount = Int((UInt16(payload[2]) << 8) | UInt16(payload[3]))
+        guard let networkID = uuid(from: payload.subdata(in: 4..<20)) else {
+            return nil
+        }
+
+        let advertisedName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let networkName = (advertisedName?.isEmpty == false) ? advertisedName! : "TacNet Network"
+
+        return NetworkAdvertisement(
+            networkID: networkID,
+            networkName: networkName,
+            openSlotCount: openSlotCount,
+            requiresPIN: (flags & requiresPINFlag) != 0
+        )
+    }
+
+    private static func uuidData(_ uuid: UUID) -> Data {
+        var rawUUID = uuid.uuid
+        return withUnsafeBytes(of: &rawUUID) { Data($0) }
+    }
+
+    private static func uuid(from data: Data) -> UUID? {
+        guard data.count == 16 else {
+            return nil
+        }
+
+        var rawUUID: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        _ = withUnsafeMutableBytes(of: &rawUUID) { destination in
+            data.copyBytes(to: destination)
+        }
+        return UUID(uuid: rawUUID)
+    }
+}
+
+enum BluetoothMeshTransportError: Error {
+    case unsupportedTreeConfigRead
+    case unknownPeer
+    case treeConfigUnavailable
+}
+
 enum BluetoothMeshTransportEvent: Sendable {
     case discoveredPeer(UUID)
+    case discoveredNetwork(UUID, NetworkAdvertisement)
     case connectionStateChanged(UUID, PeerConnectionState)
     case receivedData(Data, from: UUID)
 }
@@ -25,6 +132,19 @@ protocol BluetoothMeshTransporting: AnyObject {
     func start()
     func stop()
     func send(_ data: Data, messageType: Message.MessageType, to peerIDs: Set<UUID>)
+    func configureAdvertisement(_ summary: NetworkAdvertisement?)
+    func updateTreeConfigPayload(_ data: Data)
+    func requestTreeConfig(from peerID: UUID, completion: @escaping (Result<Data, Error>) -> Void)
+}
+
+extension BluetoothMeshTransporting {
+    func configureAdvertisement(_: NetworkAdvertisement?) {}
+
+    func updateTreeConfigPayload(_: Data) {}
+
+    func requestTreeConfig(from _: UUID, completion: @escaping (Result<Data, Error>) -> Void) {
+        completion(.failure(BluetoothMeshTransportError.unsupportedTreeConfigRead))
+    }
 }
 
 private enum BluetoothMeshCharacteristicKind: CaseIterable {
@@ -48,10 +168,12 @@ final class BluetoothMeshService {
     typealias MessageHandler = (Message) -> Void
     typealias PeerStateHandler = (UUID, PeerConnectionState) -> Void
     typealias PeerDiscoveryHandler = (UUID) -> Void
+    typealias NetworkDiscoveryHandler = (UUID, NetworkAdvertisement) -> Void
 
     var onMessageReceived: MessageHandler?
     var onPeerConnectionStateChanged: PeerStateHandler?
     var onPeerDiscovered: PeerDiscoveryHandler?
+    var onNetworkDiscovered: NetworkDiscoveryHandler?
 
     private let transport: BluetoothMeshTransporting
     private let deduplicator: MessageDeduplicator
@@ -83,6 +205,47 @@ final class BluetoothMeshService {
 
     func stop() {
         transport.stop()
+    }
+
+    func publishNetwork(_ networkConfig: NetworkConfig) {
+        transport.configureAdvertisement(NetworkAdvertisement(from: networkConfig))
+        if let payload = try? encoder.encode(networkConfig) {
+            transport.updateTreeConfigPayload(payload)
+        }
+        start()
+    }
+
+    func updatePublishedNetwork(_ networkConfig: NetworkConfig) {
+        publishNetwork(networkConfig)
+    }
+
+    func clearPublishedNetwork() {
+        transport.configureAdvertisement(nil)
+        transport.updateTreeConfigPayload(Data())
+    }
+
+    func fetchNetworkConfig(from peerID: UUID, completion: @escaping (Result<NetworkConfig, Error>) -> Void) {
+        transport.requestTreeConfig(from: peerID) { result in
+            switch result {
+            case .success(let data):
+                do {
+                    let decoded = try JSONDecoder().decode(NetworkConfig.self, from: data)
+                    completion(.success(decoded))
+                } catch {
+                    completion(.failure(error))
+                }
+            case .failure(let error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func fetchNetworkConfig(from peerID: UUID) async throws -> NetworkConfig {
+        try await withCheckedThrowingContinuation { continuation in
+            fetchNetworkConfig(from: peerID) { result in
+                continuation.resume(with: result)
+            }
+        }
     }
 
     func publish(_ message: Message) {
@@ -117,6 +280,9 @@ final class BluetoothMeshService {
         switch event {
         case .discoveredPeer(let peerID):
             onPeerDiscovered?(peerID)
+
+        case .discoveredNetwork(let peerID, let summary):
+            onNetworkDiscovered?(peerID, summary)
 
         case .connectionStateChanged(let peerID, let state):
             peerStates[peerID] = state
@@ -209,6 +375,8 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
 
     private var hasPublishedService = false
     private var treeConfigPayload: Data = Data()
+    private var advertisedNetworkSummary: NetworkAdvertisement?
+    private var pendingTreeConfigReadCompletions: [UUID: [(Result<Data, Error>) -> Void]] = [:]
 
     private lazy var broadcastCharacteristic: CBMutableCharacteristic = {
         CBMutableCharacteristic(
@@ -261,6 +429,14 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
         }
         peripheralManager?.stopAdvertising()
 
+        for peerID in Array(pendingTreeConfigReadCompletions.keys) {
+            completeTreeConfigReads(
+                for: peerID,
+                result: .failure(BluetoothMeshTransportError.treeConfigUnavailable)
+            )
+        }
+
+        discoveredPeripherals.removeAll()
         connectingPeripheralIDs.removeAll()
         connectedPeripherals.removeAll()
         discoveredCharacteristicsByPeer.removeAll()
@@ -285,6 +461,47 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
         }
     }
 
+    func configureAdvertisement(_ summary: NetworkAdvertisement?) {
+        advertisedNetworkSummary = summary
+        guard peripheralManager?.state == .poweredOn else {
+            return
+        }
+        startAdvertising()
+    }
+
+    func updateTreeConfigPayload(_ data: Data) {
+        treeConfigPayload = data
+    }
+
+    func requestTreeConfig(from peerID: UUID, completion: @escaping (Result<Data, Error>) -> Void) {
+        pendingTreeConfigReadCompletions[peerID, default: []].append(completion)
+
+        if centralManager == nil || peripheralManager == nil {
+            start()
+        }
+
+        guard let peripheral = connectedPeripherals[peerID] ?? discoveredPeripherals[peerID] else {
+            completeTreeConfigReads(for: peerID, result: .failure(BluetoothMeshTransportError.unknownPeer))
+            return
+        }
+
+        peripheral.delegate = self
+        if let characteristic = discoveredCharacteristicsByPeer[peerID]?[.treeConfig] {
+            peripheral.readValue(for: characteristic)
+            return
+        }
+
+        if connectedPeripherals[peerID] == nil,
+           let centralManager,
+           centralManager.state == .poweredOn,
+           !connectingPeripheralIDs.contains(peerID) {
+            connectingPeripheralIDs.insert(peerID)
+            centralManager.connect(peripheral, options: nil)
+        }
+
+        peripheral.discoverServices([BluetoothMeshUUIDs.service])
+    }
+
     private func startScanning() {
         centralManager?.scanForPeripherals(
             withServices: [BluetoothMeshUUIDs.service],
@@ -293,9 +510,18 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
     }
 
     private func startAdvertising() {
-        peripheralManager?.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [BluetoothMeshUUIDs.service]
-        ])
+        guard let peripheralManager else {
+            return
+        }
+
+        peripheralManager.stopAdvertising()
+        if let advertisedNetworkSummary {
+            peripheralManager.startAdvertising(NetworkAdvertisementCodec.advertisingData(for: advertisedNetworkSummary))
+        } else {
+            peripheralManager.startAdvertising([
+                CBAdvertisementDataServiceUUIDsKey: [BluetoothMeshUUIDs.service]
+            ])
+        }
     }
 
     private func publishServiceIfNeeded() {
@@ -333,6 +559,26 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
             return treeConfigCharacteristic
         }
     }
+
+    private func attemptTreeConfigRead(for peerID: UUID) {
+        guard pendingTreeConfigReadCompletions[peerID] != nil,
+              let peripheral = connectedPeripherals[peerID],
+              let treeConfigCharacteristic = discoveredCharacteristicsByPeer[peerID]?[.treeConfig] else {
+            return
+        }
+
+        peripheral.readValue(for: treeConfigCharacteristic)
+    }
+
+    private func completeTreeConfigReads(for peerID: UUID, result: Result<Data, Error>) {
+        guard let completions = pendingTreeConfigReadCompletions.removeValue(forKey: peerID) else {
+            return
+        }
+
+        completions.forEach { completion in
+            completion(result)
+        }
+    }
 }
 
 extension CoreBluetoothMeshTransport: CBCentralManagerDelegate {
@@ -351,6 +597,9 @@ extension CoreBluetoothMeshTransport: CBCentralManagerDelegate {
     ) {
         discoveredPeripherals[peripheral.identifier] = peripheral
         eventHandler?(.discoveredPeer(peripheral.identifier))
+        if let advertisement = NetworkAdvertisementCodec.decode(advertisementData: advertisementData) {
+            eventHandler?(.discoveredNetwork(peripheral.identifier, advertisement))
+        }
 
         if connectedPeripherals[peripheral.identifier] == nil,
            !connectingPeripheralIDs.contains(peripheral.identifier) {
@@ -366,11 +615,16 @@ extension CoreBluetoothMeshTransport: CBCentralManagerDelegate {
 
         peripheral.delegate = self
         peripheral.discoverServices([BluetoothMeshUUIDs.service])
+        attemptTreeConfigRead(for: peripheral.identifier)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         connectingPeripheralIDs.remove(peripheral.identifier)
         eventHandler?(.connectionStateChanged(peripheral.identifier, .disconnected))
+        completeTreeConfigReads(
+            for: peripheral.identifier,
+            result: .failure(error ?? BluetoothMeshTransportError.treeConfigUnavailable)
+        )
     }
 
     func centralManager(
@@ -382,6 +636,10 @@ extension CoreBluetoothMeshTransport: CBCentralManagerDelegate {
         connectedPeripherals.removeValue(forKey: peripheral.identifier)
         discoveredCharacteristicsByPeer.removeValue(forKey: peripheral.identifier)
         eventHandler?(.connectionStateChanged(peripheral.identifier, .disconnected))
+        completeTreeConfigReads(
+            for: peripheral.identifier,
+            result: .failure(error ?? BluetoothMeshTransportError.treeConfigUnavailable)
+        )
     }
 }
 
@@ -427,12 +685,29 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
         }
 
         discoveredCharacteristicsByPeer[peripheral.identifier] = map
+        attemptTreeConfigRead(for: peripheral.identifier)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == BluetoothMeshUUIDs.treeConfigCharacteristic,
+           pendingTreeConfigReadCompletions[peripheral.identifier] != nil {
+            if let error {
+                completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
+            } else if let value = characteristic.value {
+                completeTreeConfigReads(for: peripheral.identifier, result: .success(value))
+            } else {
+                completeTreeConfigReads(
+                    for: peripheral.identifier,
+                    result: .failure(BluetoothMeshTransportError.treeConfigUnavailable)
+                )
+            }
+            return
+        }
+
         guard error == nil, let value = characteristic.value else {
             return
         }
+
         eventHandler?(.receivedData(value, from: peripheral.identifier))
     }
 }
@@ -502,5 +777,163 @@ extension CoreBluetoothMeshTransport: CBPeripheralManagerDelegate {
     ) {
         subscribedCentrals.removeValue(forKey: central.identifier)
         eventHandler?(.connectionStateChanged(central.identifier, .disconnected))
+    }
+}
+
+enum TreeSyncConvergenceResult: Equatable {
+    case adoptedInitial(version: Int)
+    case replacedWithHigherVersion(previousVersion: Int, appliedVersion: Int)
+    case ignoredStale(localVersion: Int, incomingVersion: Int)
+    case ignoredDifferentNetwork(expectedNetworkID: UUID, incomingNetworkID: UUID)
+}
+
+enum TreeSyncJoinError: Error, Equatable {
+    case treeConfigUnavailable
+    case networkMismatch
+    case pinRequired
+    case invalidPIN
+}
+
+@MainActor
+final class TreeSyncService: ObservableObject {
+    @Published private(set) var localConfig: NetworkConfig?
+
+    private let meshService: BluetoothMeshService
+
+    init(meshService: BluetoothMeshService = BluetoothMeshService()) {
+        self.meshService = meshService
+    }
+
+    func setLocalConfig(_ config: NetworkConfig?) {
+        localConfig = config
+    }
+
+    @discardableResult
+    func converge(with incoming: NetworkConfig) -> TreeSyncConvergenceResult {
+        guard let localConfig else {
+            self.localConfig = incoming
+            return .adoptedInitial(version: incoming.version)
+        }
+
+        guard localConfig.networkID == incoming.networkID else {
+            return .ignoredDifferentNetwork(
+                expectedNetworkID: localConfig.networkID,
+                incomingNetworkID: incoming.networkID
+            )
+        }
+
+        guard incoming.version > localConfig.version else {
+            return .ignoredStale(localVersion: localConfig.version, incomingVersion: incoming.version)
+        }
+
+        self.localConfig = incoming
+        return .replacedWithHigherVersion(
+            previousVersion: localConfig.version,
+            appliedVersion: incoming.version
+        )
+    }
+
+    @discardableResult
+    func converge(with payload: Data) throws -> TreeSyncConvergenceResult {
+        let incoming = try JSONDecoder().decode(NetworkConfig.self, from: payload)
+        return converge(with: incoming)
+    }
+
+    func join(network: DiscoveredNetwork, pin: String?) async throws -> NetworkConfig {
+        let remoteConfig: NetworkConfig
+        do {
+            remoteConfig = try await meshService.fetchNetworkConfig(from: network.peerID)
+        } catch {
+            throw TreeSyncJoinError.treeConfigUnavailable
+        }
+
+        guard remoteConfig.networkID == network.networkID else {
+            throw TreeSyncJoinError.networkMismatch
+        }
+
+        if remoteConfig.requiresPIN {
+            guard let pin, !pin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw TreeSyncJoinError.pinRequired
+            }
+
+            guard remoteConfig.isValidPIN(pin) else {
+                throw TreeSyncJoinError.invalidPIN
+            }
+        }
+
+        localConfig = remoteConfig
+        return remoteConfig
+    }
+}
+
+@MainActor
+final class NetworkDiscoveryService: ObservableObject {
+    @Published private(set) var nearbyNetworks: [DiscoveredNetwork] = []
+    @Published private(set) var isScanning = false
+
+    private let meshService: BluetoothMeshService
+    private var scanTimeoutTask: Task<Void, Never>?
+
+    init(meshService: BluetoothMeshService = BluetoothMeshService()) {
+        self.meshService = meshService
+    }
+
+    deinit {
+        scanTimeoutTask?.cancel()
+    }
+
+    func startScanning(timeout: TimeInterval = 10) {
+        nearbyNetworks = []
+        isScanning = true
+
+        meshService.onNetworkDiscovered = { [weak self] peerID, summary in
+            Task { @MainActor in
+                self?.upsert(
+                    DiscoveredNetwork(
+                        peerID: peerID,
+                        networkID: summary.networkID,
+                        networkName: summary.networkName,
+                        openSlotCount: summary.openSlotCount,
+                        requiresPIN: summary.requiresPIN
+                    )
+                )
+            }
+        }
+
+        meshService.start()
+        scanTimeoutTask?.cancel()
+
+        let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
+        scanTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            guard !Task.isCancelled else {
+                return
+            }
+            await MainActor.run {
+                self?.isScanning = false
+            }
+        }
+    }
+
+    func stopScanning() {
+        isScanning = false
+        scanTimeoutTask?.cancel()
+        scanTimeoutTask = nil
+        meshService.onNetworkDiscovered = nil
+    }
+
+    private func upsert(_ network: DiscoveredNetwork) {
+        if let index = nearbyNetworks.firstIndex(where: { $0.peerID == network.peerID }) {
+            nearbyNetworks[index] = network
+        } else {
+            nearbyNetworks.append(network)
+        }
+
+        nearbyNetworks.sort { lhs, rhs in
+            if lhs.openSlotCount == rhs.openSlotCount {
+                return lhs.networkName.localizedCaseInsensitiveCompare(rhs.networkName) == .orderedAscending
+            }
+            return lhs.openSlotCount > rhs.openSlotCount
+        }
     }
 }

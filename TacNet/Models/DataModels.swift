@@ -33,6 +33,38 @@ struct NetworkConfig: Codable, Equatable, Sendable {
         case tree
     }
 
+    var requiresPIN: Bool {
+        pinHash != nil
+    }
+
+    var openSlotCount: Int {
+        if tree.label.isEmpty, tree.claimedBy == nil, tree.children.isEmpty {
+            return 0
+        }
+        return tree.openSlotCount
+    }
+
+    static func hashPIN(_ pin: String?) -> String? {
+        guard let pin else {
+            return nil
+        }
+
+        let trimmed = pin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        let digest = SHA256.hash(data: Data(trimmed.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func isValidPIN(_ pin: String?) -> Bool {
+        if pinHash == nil {
+            return true
+        }
+        return NetworkConfig.hashPIN(pin) == pinHash
+    }
+
     mutating func applyMutation(_ mutateTree: (inout TreeNode) -> Void) {
         mutateTree(&tree)
         version += 1
@@ -48,6 +80,16 @@ struct NetworkConfig: Codable, Equatable, Sendable {
         }
         self = incoming
         return true
+    }
+}
+
+extension TreeNode {
+    var openSlotCount: Int {
+        let selfOpen = claimedBy == nil ? 1 : 0
+        let childOpen = children.reduce(0) { partial, child in
+            partial + child.openSlotCount
+        }
+        return selfOpen + childOpen
     }
 }
 
@@ -523,17 +565,7 @@ final class TreeBuilderViewModel: ObservableObject, @unchecked Sendable {
     }
 
     private static func pinHash(from pin: String?) -> String? {
-        guard let pin else {
-            return nil
-        }
-
-        let trimmed = pin.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-
-        let digest = SHA256.hash(data: Data(trimmed.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        NetworkConfig.hashPIN(pin)
     }
 
     private static func jsonEncoder(prettyPrinted: Bool) -> JSONEncoder {

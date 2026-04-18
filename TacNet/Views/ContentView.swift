@@ -5,6 +5,7 @@ struct ContentView: View {
     @StateObject private var treeBuilderViewModel = TreeBuilderViewModel(
         createdBy: ProcessInfo.processInfo.hostName
     )
+    @StateObject private var appNetworkCoordinator = AppNetworkCoordinator()
     @State private var onboardingRoute: OnboardingRoute = .welcome
 
     private enum OnboardingRoute {
@@ -37,12 +38,21 @@ struct ContentView: View {
                 }
 
             case .createNetwork:
-                TreeBuilderView(viewModel: treeBuilderViewModel) {
-                    onboardingRoute = .welcome
-                }
+                TreeBuilderView(
+                    viewModel: treeBuilderViewModel,
+                    onBack: {
+                        onboardingRoute = .welcome
+                    },
+                    onPublishNetwork: { config in
+                        appNetworkCoordinator.publish(networkConfig: config)
+                    }
+                )
 
             case .joinNetwork:
-                JoinNetworkPlaceholderView {
+                JoinNetworkFlowView(
+                    discoveryService: appNetworkCoordinator.discoveryService,
+                    treeSyncService: appNetworkCoordinator.treeSyncService
+                ) {
                     onboardingRoute = .welcome
                 }
             }
@@ -135,16 +145,23 @@ struct WelcomeView: View {
 struct TreeBuilderView: View {
     @ObservedObject var viewModel: TreeBuilderViewModel
     let onBack: (() -> Void)?
+    let onPublishNetwork: ((NetworkConfig) -> Void)?
 
     @State private var networkNameDraft: String
     @State private var pinDraft: String
     @State private var selectedNodeID: String?
     @State private var renameDraft: String
     @State private var newChildLabelDraft: String = ""
+    @State private var isPublished = false
 
-    init(viewModel: TreeBuilderViewModel, onBack: (() -> Void)? = nil) {
+    init(
+        viewModel: TreeBuilderViewModel,
+        onBack: (() -> Void)? = nil,
+        onPublishNetwork: ((NetworkConfig) -> Void)? = nil
+    ) {
         _viewModel = ObservedObject(wrappedValue: viewModel)
         self.onBack = onBack
+        self.onPublishNetwork = onPublishNetwork
         _networkNameDraft = State(initialValue: viewModel.networkConfig.networkName)
         _pinDraft = State(initialValue: "")
         _selectedNodeID = State(initialValue: viewModel.networkConfig.tree.id)
@@ -173,6 +190,25 @@ struct TreeBuilderView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+
+                        HStack(spacing: 10) {
+                            Button(isPublished ? "Update BLE Publish" : "Publish Network") {
+                                onPublishNetwork?(viewModel.networkConfig)
+                                isPublished = true
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(onPublishNetwork == nil)
+
+                            if isPublished {
+                                Label("Advertising live", systemImage: "dot.radiowaves.left.and.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+                        }
+
+                        Text("Open slots: \(viewModel.networkConfig.openSlotCount)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -275,6 +311,12 @@ struct TreeBuilderView: View {
             }
             renameDraft = node.label
         }
+        .onReceive(viewModel.$networkConfig) { updatedConfig in
+            guard isPublished else {
+                return
+            }
+            onPublishNetwork?(updatedConfig)
+        }
     }
 
     private var selectedNodeSummary: String {
@@ -340,26 +382,271 @@ private struct TreeNodeTreeView: View {
     }
 }
 
-private struct JoinNetworkPlaceholderView: View {
+private struct JoinNetworkFlowView: View {
+    @ObservedObject var discoveryService: NetworkDiscoveryService
+    @ObservedObject var treeSyncService: TreeSyncService
+    let onBack: () -> Void
+
+    @State private var selectedPINNetwork: DiscoveredNetwork?
+    @State private var pinDraft = ""
+    @State private var joinErrorMessage: String?
+    @State private var isJoining = false
+    @State private var joinedConfig: NetworkConfig?
+
+    var body: some View {
+        Group {
+            if let joinedConfig {
+                joinedState(config: joinedConfig)
+            } else if let selectedPINNetwork {
+                pinEntryState(network: selectedPINNetwork)
+            } else {
+                NetworkScanView(
+                    discoveryService: discoveryService,
+                    onSelectNetwork: handleNetworkSelection,
+                    onBack: onBack
+                )
+            }
+        }
+        .navigationTitle("Join")
+        .onDisappear {
+            discoveryService.stopScanning()
+        }
+    }
+
+    @ViewBuilder
+    private func pinEntryState(network: DiscoveredNetwork) -> some View {
+        PinEntryView(
+            network: network,
+            pin: $pinDraft,
+            errorMessage: joinErrorMessage,
+            isJoining: isJoining,
+            onSubmit: {
+                Task {
+                    await join(network: network, pin: pinDraft)
+                }
+            },
+            onCancel: {
+                selectedPINNetwork = nil
+                pinDraft = ""
+                joinErrorMessage = nil
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func joinedState(config: NetworkConfig) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Joined \(config.networkName)", systemImage: "checkmark.seal.fill")
+                .font(.headline)
+                .foregroundStyle(.green)
+
+            Text("Version \(config.version) • Open slots \(config.openSlotCount)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            GroupBox("Received Tree JSON") {
+                ScrollView {
+                    Text(prettyPrintedJSON(for: config) ?? "{}")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 260)
+            }
+
+            HStack(spacing: 10) {
+                Button("Join Another Network") {
+                    joinedConfig = nil
+                    selectedPINNetwork = nil
+                    pinDraft = ""
+                    joinErrorMessage = nil
+                    discoveryService.startScanning(timeout: 10)
+                }
+                .buttonStyle(.bordered)
+
+                Button("Back", action: onBack)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
+    }
+
+    private func handleNetworkSelection(_ network: DiscoveredNetwork) {
+        joinErrorMessage = nil
+
+        if network.requiresPIN {
+            selectedPINNetwork = network
+            pinDraft = ""
+            return
+        }
+
+        Task {
+            await join(network: network, pin: nil)
+        }
+    }
+
+    private func join(network: DiscoveredNetwork, pin: String?) async {
+        guard !isJoining else {
+            return
+        }
+
+        isJoining = true
+        defer { isJoining = false }
+
+        do {
+            let joined = try await treeSyncService.join(network: network, pin: pin)
+            joinedConfig = joined
+            selectedPINNetwork = nil
+            joinErrorMessage = nil
+            discoveryService.stopScanning()
+        } catch let error as TreeSyncJoinError {
+            joinErrorMessage = joinErrorMessage(for: error)
+        } catch {
+            joinErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func joinErrorMessage(for error: TreeSyncJoinError) -> String {
+        switch error {
+        case .treeConfigUnavailable:
+            return "Unable to fetch tree data from organiser. Try scanning again."
+        case .networkMismatch:
+            return "Discovered network details changed. Please rescan."
+        case .pinRequired:
+            return "PIN is required to join this network."
+        case .invalidPIN:
+            return "Incorrect PIN. Join blocked."
+        }
+    }
+
+    private func prettyPrintedJSON(for config: NetworkConfig) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(config.tree) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+private struct NetworkScanView: View {
+    @ObservedObject var discoveryService: NetworkDiscoveryService
+    let onSelectNetwork: (DiscoveredNetwork) -> Void
     let onBack: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "dot.radiowaves.left.and.right")
-                .font(.system(size: 44))
-                .foregroundStyle(Color.accentColor)
-            Text("Join Network")
-                .font(.title3)
-                .fontWeight(.semibold)
-            Text("Network discovery UI will appear here.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            if discoveryService.nearbyNetworks.isEmpty {
+                VStack(spacing: 8) {
+                    if discoveryService.isScanning {
+                        ProgressView()
+                    }
 
-            Button("Back", action: onBack)
+                    Text(discoveryService.isScanning ? "Scanning for nearby TacNet networks…" : "No networks found.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(discoveryService.nearbyNetworks) { network in
+                    Button {
+                        onSelectNetwork(network)
+                    } label: {
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(network.networkName)
+                                    .font(.headline)
+                                    .foregroundStyle(.primary)
+                                Text("Open slots: \(network.openSlotCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            Image(systemName: network.requiresPIN ? "lock.fill" : "lock.open.fill")
+                                .foregroundStyle(network.requiresPIN ? .orange : .green)
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+
+            HStack(spacing: 12) {
+                Button("Rescan (10s)") {
+                    discoveryService.startScanning(timeout: 10)
+                }
                 .buttonStyle(.bordered)
+
+                Button("Back", action: onBack)
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(.bottom, 8)
+        }
+        .padding(.horizontal)
+        .task {
+            discoveryService.startScanning(timeout: 10)
+        }
+    }
+}
+
+private struct PinEntryView: View {
+    let network: DiscoveredNetwork
+    @Binding var pin: String
+    let errorMessage: String?
+    let isJoining: Bool
+    let onSubmit: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 40))
+                .foregroundStyle(.orange)
+
+            Text("Enter PIN for \(network.networkName)")
+                .font(.headline)
+                .multilineTextAlignment(.center)
+
+            SecureField("Network PIN", text: $pin)
+                .textFieldStyle(.roundedBorder)
+                .textContentType(.oneTimeCode)
+                .keyboardType(.numberPad)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+
+            HStack(spacing: 10) {
+                Button("Cancel", action: onCancel)
+                    .buttonStyle(.bordered)
+
+                Button(isJoining ? "Joining…" : "Join Network", action: onSubmit)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isJoining)
+            }
         }
         .padding()
-        .navigationTitle("Join")
+    }
+}
+
+@MainActor
+final class AppNetworkCoordinator: ObservableObject {
+    let meshService: BluetoothMeshService
+    let discoveryService: NetworkDiscoveryService
+    let treeSyncService: TreeSyncService
+
+    init(meshService: BluetoothMeshService = BluetoothMeshService()) {
+        self.meshService = meshService
+        discoveryService = NetworkDiscoveryService(meshService: meshService)
+        treeSyncService = TreeSyncService(meshService: meshService)
+    }
+
+    func publish(networkConfig: NetworkConfig) {
+        meshService.publishNetwork(networkConfig)
     }
 }
 

@@ -806,6 +806,131 @@ final class TacNetTests: XCTestCase {
         XCTAssertEqual(Array(viewModel.versionHistory.suffix(editCount)), expectedVersions, "Concurrent edits should still produce a strictly monotonic, gap-free version sequence")
     }
 
+    @MainActor
+    func testTreeSyncServiceHigherVersionWinsAndLowerVersionDiscarded() async {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+
+        let networkID = UUID(uuidString: "12345678-1234-1234-1234-1234567890AB")!
+        let local = makeNetworkConfig(networkID: networkID, version: 3, rootLabel: "Local")
+        syncService.setLocalConfig(local)
+
+        let incomingHigher = makeNetworkConfig(networkID: networkID, version: 6, rootLabel: "Incoming Higher")
+        let resultHigher = syncService.converge(with: incomingHigher)
+        XCTAssertEqual(resultHigher, .replacedWithHigherVersion(previousVersion: 3, appliedVersion: 6))
+        XCTAssertEqual(syncService.localConfig?.version, 6)
+        XCTAssertEqual(syncService.localConfig?.tree.label, "Incoming Higher")
+
+        let incomingLower = makeNetworkConfig(networkID: networkID, version: 4, rootLabel: "Incoming Lower")
+        let resultLower = syncService.converge(with: incomingLower)
+        XCTAssertEqual(resultLower, .ignoredStale(localVersion: 6, incomingVersion: 4))
+        XCTAssertEqual(syncService.localConfig?.version, 6)
+        XCTAssertEqual(syncService.localConfig?.tree.label, "Incoming Higher")
+    }
+
+    @MainActor
+    func testTreeSyncServiceOutOfOrderUpdatesConvergeToHighestVersion() async {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+
+        let networkID = UUID(uuidString: "ABCDEFAB-1234-5678-90AB-ABCDEFABCDEF")!
+        syncService.setLocalConfig(makeNetworkConfig(networkID: networkID, version: 1, rootLabel: "v1"))
+
+        let v3 = makeNetworkConfig(networkID: networkID, version: 3, rootLabel: "v3")
+        let v7 = makeNetworkConfig(networkID: networkID, version: 7, rootLabel: "v7")
+        let v5 = makeNetworkConfig(networkID: networkID, version: 5, rootLabel: "v5")
+
+        XCTAssertEqual(syncService.converge(with: v3), .replacedWithHigherVersion(previousVersion: 1, appliedVersion: 3))
+        XCTAssertEqual(syncService.converge(with: v7), .replacedWithHigherVersion(previousVersion: 3, appliedVersion: 7))
+        XCTAssertEqual(syncService.converge(with: v5), .ignoredStale(localVersion: 7, incomingVersion: 5))
+        XCTAssertEqual(syncService.localConfig?.version, 7)
+        XCTAssertEqual(syncService.localConfig?.tree.label, "v7")
+    }
+
+    @MainActor
+    func testTreeSyncServiceSameVersionIsNoOp() async {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+
+        let networkID = UUID(uuidString: "FEDCBA98-7654-3210-FEDC-BA9876543210")!
+        syncService.setLocalConfig(makeNetworkConfig(networkID: networkID, version: 4, rootLabel: "Local v4"))
+
+        let sameVersionDifferentTree = makeNetworkConfig(networkID: networkID, version: 4, rootLabel: "Incoming v4")
+        let result = syncService.converge(with: sameVersionDifferentTree)
+
+        XCTAssertEqual(result, .ignoredStale(localVersion: 4, incomingVersion: 4))
+        XCTAssertEqual(syncService.localConfig?.version, 4)
+        XCTAssertEqual(syncService.localConfig?.tree.label, "Local v4", "Same-version updates should be a no-op")
+    }
+
+    @MainActor
+    func testTreeSyncJoinRejectsWrongPINAndDoesNotLeakTree() async throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+
+        let peerID = UUID(uuidString: "AAAAAAAA-1111-2222-3333-BBBBBBBBBBBB")!
+        let remote = makeNetworkConfig(
+            networkID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            version: 2,
+            rootLabel: "Sensitive Tree",
+            pin: "1234"
+        )
+        transport.setTreeConfig(remote, for: peerID)
+
+        let discovered = DiscoveredNetwork(
+            peerID: peerID,
+            networkID: remote.networkID,
+            networkName: remote.networkName,
+            openSlotCount: remote.openSlotCount,
+            requiresPIN: true
+        )
+
+        do {
+            _ = try await syncService.join(network: discovered, pin: "0000")
+            XCTFail("Expected invalid PIN rejection")
+        } catch let error as TreeSyncJoinError {
+            XCTAssertEqual(error, .invalidPIN)
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+
+        XCTAssertNil(syncService.localConfig, "Tree should not be stored locally when PIN is invalid")
+    }
+
+    @MainActor
+    func testTreeSyncJoinAllowsDirectJoinForPINLessNetwork() async throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
+        let syncService = TreeSyncService(meshService: meshService)
+
+        let peerID = UUID(uuidString: "BBBBBBBB-1111-2222-3333-CCCCCCCCCCCC")!
+        let remote = makeNetworkConfig(
+            networkID: UUID(uuidString: "66666666-7777-8888-9999-AAAAAAAAAAAA")!,
+            version: 9,
+            rootLabel: "PIN-less Tree",
+            pin: nil
+        )
+        transport.setTreeConfig(remote, for: peerID)
+
+        let discovered = DiscoveredNetwork(
+            peerID: peerID,
+            networkID: remote.networkID,
+            networkName: remote.networkName,
+            openSlotCount: remote.openSlotCount,
+            requiresPIN: false
+        )
+
+        let joined = try await syncService.join(network: discovered, pin: nil)
+        XCTAssertEqual(joined.networkID, remote.networkID)
+        XCTAssertEqual(joined.version, remote.version)
+        XCTAssertEqual(joined.tree.label, "PIN-less Tree")
+        XCTAssertEqual(syncService.localConfig?.networkID, remote.networkID)
+    }
+
     private func makeMeshMessage(
         id: UUID = UUID(),
         ttl: Int,
@@ -829,6 +954,30 @@ final class TacNetTests: XCTestCase {
 
     private func decodeMessage(from data: Data) throws -> Message {
         try JSONDecoder().decode(Message.self, from: data)
+    }
+
+    private func makeNetworkConfig(
+        networkID: UUID,
+        version: Int,
+        rootLabel: String,
+        pin: String? = nil
+    ) -> NetworkConfig {
+        NetworkConfig(
+            networkName: "Net-\(version)",
+            networkID: networkID,
+            createdBy: "organiser",
+            pinHash: NetworkConfig.hashPIN(pin),
+            version: version,
+            tree: TreeNode(
+                id: "root",
+                label: rootLabel,
+                claimedBy: nil,
+                children: [
+                    TreeNode(id: "alpha", label: "Alpha", claimedBy: nil, children: []),
+                    TreeNode(id: "bravo", label: "Bravo", claimedBy: "claimed-device", children: [])
+                ]
+            )
+        )
     }
 
     private func makeFixtureTree() -> TreeNode {
@@ -927,6 +1076,9 @@ private final class MockBluetoothMeshTransport: BluetoothMeshTransporting {
 
     var eventHandler: ((BluetoothMeshTransportEvent) -> Void)?
     private(set) var sentPackets: [SentPacket] = []
+    private var treeConfigByPeer: [UUID: Data] = [:]
+    private(set) var lastConfiguredAdvertisement: NetworkAdvertisement?
+    private(set) var configuredTreeConfigPayload: Data = Data()
 
     func start() {}
 
@@ -938,6 +1090,32 @@ private final class MockBluetoothMeshTransport: BluetoothMeshTransporting {
 
     func emit(_ event: BluetoothMeshTransportEvent) {
         eventHandler?(event)
+    }
+
+    func configureAdvertisement(_ summary: NetworkAdvertisement?) {
+        lastConfiguredAdvertisement = summary
+    }
+
+    func updateTreeConfigPayload(_ data: Data) {
+        configuredTreeConfigPayload = data
+    }
+
+    func requestTreeConfig(from peerID: UUID, completion: @escaping (Result<Data, Error>) -> Void) {
+        if let payload = treeConfigByPeer[peerID] {
+            completion(.success(payload))
+            return
+        }
+
+        guard !configuredTreeConfigPayload.isEmpty else {
+            completion(.failure(BluetoothMeshTransportError.treeConfigUnavailable))
+            return
+        }
+
+        completion(.success(configuredTreeConfigPayload))
+    }
+
+    func setTreeConfig(_ networkConfig: NetworkConfig, for peerID: UUID) {
+        treeConfigByPeer[peerID] = try? JSONEncoder().encode(networkConfig)
     }
 }
 
