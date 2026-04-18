@@ -71,16 +71,31 @@ Reads as defense-tech immediately without cloning any one reference site; pairs 
 - Single display family keeps the page disciplined; hierarchy comes from weight (300 → 700) not family-swapping.
 
 ### 2.3 Motifs
-- **48px grid overlay** at 3% opacity on hero + Architecture section backgrounds. Repeating linear-gradients.
-- **Thin horizontal scan rules** between every section at 1px `rgba(232,236,233,0.08)`. No divider heavier than 1px anywhere.
-- **Section corner dots** — 3px circles at top-left/top-right at `rgba(232,236,233,0.2)` (AliasKit lift).
-- **Grain PNG overlay** at 4% opacity on body. 256×256 tile, generated at build time.
-- **Inset page border** at `rgba(232,236,233,0.06)` framing the whole layout on desktop (AliasKit lift). Feels like a document.
-- **Numbered section rail** — "01 / MESH DISCOVERY", "02 / ROLE CLAIM", etc., in mono uppercase (Saronic lift).
-- **Data readouts** — big mono numerals with tiny uppercase labels below them (AliasKit StatsBand lift).
+
+**AliasKit lifts — locked.** The team explicitly approved pulling heavily from `aliaskit.com`'s chrome. We adopt these patterns verbatim and only change their palette + copy:
+
+- **Floating / contracting nav** — fixed top, inset 16px from edges, `backdrop-filter: blur(24px)`, width transitions from `min(1200px, 100% - 2rem)` to `min(760px, 100% - 2rem)` on 500ms cubic-bezier past 80px scroll. Identical mechanism to aliaskit's `Navigation.tsx`.
+- **Inset page border** — a 1px `rgba(232,236,233,0.06)` frame around the whole `<main>` on desktop, with a `clamp(0, 2vw, 16px)` outer margin. This is the "margin design" you liked; it reads as a document dossier instead of a boundless web page. Implemented in `src/app/page.tsx`.
+- **Vertical grid rails** — 1px lines at `rgba(232,236,233,0.06)` at the 1200-max-width gutters, hidden on mobile. Adds a literal "ruled paper" feel to the whole page without shouting.
+- **Section corner dots** — 3px circles at top-left/top-right of every section at `rgba(232,236,233,0.2)`.
+- **Dot + grid backgrounds** — `radial-gradient` dot field at 16px for surface sections; `linear-gradient` 48px grid at 3% opacity for hero/architecture. Both CSS only.
+- **Stacked-depth code window** — 3 overlapping divs with `translate-x-3/y-2 → translate-x-1.5/y-1 → 0,0`, each with progressively darker borders, plus a top glow line `gradient-to-r from-transparent via-[#333] to-transparent`. Direct lift from aliaskit's `HeroSection.tsx`.
+- **Custom syntax tokenizer** in code windows — strings green, keywords purple, numbers orange (OneDark-adjacent). Lifted wholesale from aliaskit.
+- **Fade-in-up stagger** — `.landing-stagger-1/2/3` at 40/120/200ms delays; killed by `prefers-reduced-motion`. Lifted verbatim.
+- **StatsBand** big-numeral + tiny-uppercase-label mono readouts — lifted wholesale, repalette'd.
+
+**TacNet-native additions on top of the lifts:**
+- **Numbered section rail** — "01 / MESH DISCOVERY", "02 / ROLE CLAIM", etc., in mono uppercase (Saronic lift, not aliaskit).
 - **`[ BRACKETED ]` labels** on CTAs and section tags — tactical without being costume.
 - **One pulsing dot** in the nav labelled `OPERATIONAL` — 2.5s ease. That's the only blinky thing on the page.
+- **Grain PNG overlay** at 4% opacity on body. 256×256 tile (placeholder until we generate).
 - **No literal military imagery.** No weapons, uniforms, flags, crosshairs, camo.
+
+**Explicit non-lifts from aliaskit** (things we deliberately skip):
+- The **Three.js Dither background** — aliaskit runs a shader across the full viewport. For TacNet the visual focus is the interactive mesh, so ambient noise steals attention. We use grain + grid only.
+- The **ASCII text shader effect** — too playful for defense posture.
+- The **indigo `#6366F1` accent** — replaced with tactical lime `#B8FF2C`.
+- The **Space Grotesk + Outfit** type pair — replaced with DM Sans to avoid clone feel.
 
 ### 2.4 Motion
 - Fade-in-up stagger (40/120/200ms delays) on section entry.
@@ -713,16 +728,16 @@ Sized for small team. Phases are sequential; each ends with a deployable checkpo
 - [x] YC framing locked (subtle footer line).
 - [ ] Cinematic video — separate track, owner = user.
 
-### Phase 1 — Manual scaffold & tokens *(½ day)*
-- **Pre-flight**: `df -h /` shows ≥ 5 GB free. If not, pause.
-- Hand-write `package.json`, `tsconfig.json`, `next.config.ts`, `postcss.config.mjs`.
-- `npm install` — only the listed deps.
-- Install fonts via `next/font/google` (DM Sans + JetBrains Mono).
-- Write `src/app/globals.css` tokens + utility classes.
-- Write `src/app/layout.tsx` with fonts + grain overlay + inset border.
-- Write empty `src/app/page.tsx` that verifies token chain works.
-- Run `npm run build` → green build is the checkpoint.
-- (Optional) Deploy to Vercel preview URL.
+### Phase 1 — Manual scaffold & tokens — **DONE**
+- [x] Pre-flight disk check (26 GB free confirmed).
+- [x] Hand-written `package.json`, `tsconfig.json`, `next.config.ts` (with `outputFileTracingRoot`), `postcss.config.mjs`, `.gitignore`, `next-env.d.ts`, `README.md`.
+- [x] `npm install` — 47 packages, clean.
+- [x] DM Sans + JetBrains Mono wired via `next/font/google` in `src/app/layout.tsx`.
+- [x] `src/app/globals.css` with Palette A tokens + grid overlay + noise + pulse + fade-in-up + reduced-motion utilities.
+- [x] `src/app/layout.tsx` with grain overlay pinned full-viewport.
+- [x] `src/app/page.tsx` with inset border, 48px grid, OPERATIONAL pulsing dot, wordmark, H1, subhead, 8-swatch token probe, 4-stat data band, CTA stubs, YC footer line.
+- [x] `npm run build` — green, 102 KB first-load JS, 4/4 static pages.
+- [ ] Vercel preview URL — deferred (needs user auth).
 
 ### Phase 2 — Shell components *(½ day)*
 - `Nav` with scroll-contract.
