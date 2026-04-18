@@ -255,6 +255,11 @@ actor CompactionEngine {
         case manual
     }
 
+    enum ProcessingStatus: String, Equatable, Sendable {
+        case idle
+        case compacting
+    }
+
     struct Configuration: Equatable, Sendable {
         var timeWindow: TimeInterval
         var messageCountThreshold: Int
@@ -271,11 +276,42 @@ actor CompactionEngine {
         }
     }
 
+    struct ProcessingMetrics: Equatable, Sendable {
+        let status: ProcessingStatus
+        let triggerReason: TriggerReason?
+        let latencyMilliseconds: Double?
+        let inputTokenCount: Int
+        let outputTokenCount: Int
+        let compressionRatio: Double?
+        let sourceMessageCount: Int
+        let updatedAt: Date
+
+        static func idle(updatedAt: Date) -> ProcessingMetrics {
+            ProcessingMetrics(
+                status: .idle,
+                triggerReason: nil,
+                latencyMilliseconds: nil,
+                inputTokenCount: 0,
+                outputTokenCount: 0,
+                compressionRatio: nil,
+                sourceMessageCount: 0,
+                updatedAt: updatedAt
+            )
+        }
+    }
+
     struct CompactionEmission: Equatable, Sendable {
         let message: Message
         let triggerReason: TriggerReason
         let sourceMessageCount: Int
+        let sourceNodeIDs: [String]
+        let destinationNodeID: String?
+        let outputText: String
         let summaryWordCount: Int
+        let inputTokenCount: Int
+        let outputTokenCount: Int
+        let compressionRatio: Double
+        let latencyMilliseconds: Double
         let generatedAt: Date
     }
 
@@ -285,6 +321,9 @@ actor CompactionEngine {
         let sourceMessageCount: Int
         let generatedAt: Date
     }
+
+    typealias ProcessingObserver = @Sendable (ProcessingMetrics) -> Void
+    typealias CompactionEmissionObserver = @Sendable (CompactionEmission) -> Void
 
     private struct QueueItem: Sendable {
         let body: String
@@ -311,6 +350,9 @@ actor CompactionEngine {
 
     private var compactionEmissionsStorage: [CompactionEmission] = []
     private var latestSitrepStorage: SITREP?
+    private var processingMetricsStorage: ProcessingMetrics = .idle(updatedAt: .distantPast)
+    private var processingObserver: ProcessingObserver?
+    private var compactionEmissionObserver: CompactionEmissionObserver?
 
     init(
         localDeviceID: String,
@@ -334,6 +376,7 @@ actor CompactionEngine {
         self.configuration = configuration
         self.now = now
         self.sleep = sleep
+        processingMetricsStorage = .idle(updatedAt: self.now())
     }
 
     deinit {
@@ -415,6 +458,19 @@ actor CompactionEngine {
         latestSitrepStorage
     }
 
+    func latestProcessingMetrics() -> ProcessingMetrics {
+        processingMetricsStorage
+    }
+
+    func setProcessingObserver(_ observer: ProcessingObserver?) {
+        processingObserver = observer
+        observer?(processingMetricsStorage)
+    }
+
+    func setCompactionEmissionObserver(_ observer: CompactionEmissionObserver?) {
+        compactionEmissionObserver = observer
+    }
+
     private var isRootNode: Bool {
         TreeHelpers.level(of: localNodeID, in: tree) == 0
     }
@@ -480,16 +536,51 @@ actor CompactionEngine {
         let queuedItems = queuedChildTranscripts
         queuedChildTranscripts.removeAll(keepingCapacity: true)
 
-        guard TreeHelpers.parent(of: localNodeID, in: tree) != nil else {
+        guard let destinationNodeID = TreeHelpers.parent(of: localNodeID, in: tree)?.id else {
             return
         }
+
+        let processingStartedAt = now()
+        let inputTokenCount = Self.estimatedTokenCount(in: queuedItems.map(\.body).joined(separator: " "))
+        updateProcessingMetrics(
+            ProcessingMetrics(
+                status: .compacting,
+                triggerReason: reason,
+                latencyMilliseconds: nil,
+                inputTokenCount: inputTokenCount,
+                outputTokenCount: 0,
+                compressionRatio: nil,
+                sourceMessageCount: queuedItems.count,
+                updatedAt: processingStartedAt
+            )
+        )
 
         let summary = await summarizeChildTranscripts(queuedItems)
+        let processingFinishedAt = now()
+        let latencyMilliseconds = processingFinishedAt.timeIntervalSince(processingStartedAt) * 1_000
+        let outputTokenCount = Self.estimatedTokenCount(in: summary)
+        let compressionRatio = Self.compressionRatio(
+            inputTokenCount: inputTokenCount,
+            outputTokenCount: outputTokenCount
+        )
+
         guard !summary.isEmpty else {
+            updateProcessingMetrics(
+                ProcessingMetrics(
+                    status: .idle,
+                    triggerReason: reason,
+                    latencyMilliseconds: latencyMilliseconds,
+                    inputTokenCount: inputTokenCount,
+                    outputTokenCount: outputTokenCount,
+                    compressionRatio: compressionRatio,
+                    sourceMessageCount: queuedItems.count,
+                    updatedAt: processingFinishedAt
+                )
+            )
             return
         }
 
-        let timestamp = now()
+        let timestamp = processingFinishedAt
         let compactionMessage = messageRouter.makeCompactionMessage(
             summary: summary,
             senderID: localDeviceID,
@@ -506,8 +597,32 @@ actor CompactionEngine {
                 message: compactionMessage,
                 triggerReason: reason,
                 sourceMessageCount: queuedItems.count,
+                sourceNodeIDs: Self.uniqueSourceNodeIDs(from: queuedItems),
+                destinationNodeID: destinationNodeID,
+                outputText: summary,
                 summaryWordCount: Self.wordCount(in: summary),
+                inputTokenCount: inputTokenCount,
+                outputTokenCount: outputTokenCount,
+                compressionRatio: compressionRatio ?? 0,
+                latencyMilliseconds: latencyMilliseconds,
                 generatedAt: timestamp
+            )
+        )
+
+        if let latestEmission = compactionEmissionsStorage.last {
+            compactionEmissionObserver?(latestEmission)
+        }
+
+        updateProcessingMetrics(
+            ProcessingMetrics(
+                status: .idle,
+                triggerReason: reason,
+                latencyMilliseconds: latencyMilliseconds,
+                inputTokenCount: inputTokenCount,
+                outputTokenCount: outputTokenCount,
+                compressionRatio: compressionRatio,
+                sourceMessageCount: queuedItems.count,
+                updatedAt: processingFinishedAt
             )
         )
     }
@@ -528,8 +643,43 @@ actor CompactionEngine {
         let queuedItems = queuedL1Compactions
         queuedL1Compactions.removeAll(keepingCapacity: true)
 
+        let processingStartedAt = now()
+        let inputTokenCount = Self.estimatedTokenCount(in: queuedItems.map(\.body).joined(separator: " "))
+        updateProcessingMetrics(
+            ProcessingMetrics(
+                status: .compacting,
+                triggerReason: reason,
+                latencyMilliseconds: nil,
+                inputTokenCount: inputTokenCount,
+                outputTokenCount: 0,
+                compressionRatio: nil,
+                sourceMessageCount: queuedItems.count,
+                updatedAt: processingStartedAt
+            )
+        )
+
         let sitrepText = await summarizeL1Compactions(queuedItems)
+        let processingFinishedAt = now()
+        let latencyMilliseconds = processingFinishedAt.timeIntervalSince(processingStartedAt) * 1_000
+        let outputTokenCount = Self.estimatedTokenCount(in: sitrepText)
+        let compressionRatio = Self.compressionRatio(
+            inputTokenCount: inputTokenCount,
+            outputTokenCount: outputTokenCount
+        )
+
         guard !sitrepText.isEmpty else {
+            updateProcessingMetrics(
+                ProcessingMetrics(
+                    status: .idle,
+                    triggerReason: reason,
+                    latencyMilliseconds: latencyMilliseconds,
+                    inputTokenCount: inputTokenCount,
+                    outputTokenCount: outputTokenCount,
+                    compressionRatio: compressionRatio,
+                    sourceMessageCount: queuedItems.count,
+                    updatedAt: processingFinishedAt
+                )
+            )
             return
         }
 
@@ -537,7 +687,20 @@ actor CompactionEngine {
             text: sitrepText,
             triggerReason: reason,
             sourceMessageCount: queuedItems.count,
-            generatedAt: now()
+            generatedAt: processingFinishedAt
+        )
+
+        updateProcessingMetrics(
+            ProcessingMetrics(
+                status: .idle,
+                triggerReason: reason,
+                latencyMilliseconds: latencyMilliseconds,
+                inputTokenCount: inputTokenCount,
+                outputTokenCount: outputTokenCount,
+                compressionRatio: compressionRatio,
+                sourceMessageCount: queuedItems.count,
+                updatedAt: processingFinishedAt
+            )
         )
     }
 
@@ -581,6 +744,11 @@ actor CompactionEngine {
         value
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func updateProcessingMetrics(_ metrics: ProcessingMetrics) {
+        processingMetricsStorage = metrics
+        processingObserver?(metrics)
     }
 
     private static let compactionSystemPrompt = """
@@ -638,6 +806,30 @@ actor CompactionEngine {
     private static func nanoseconds(from seconds: TimeInterval) -> UInt64 {
         let clamped = max(0, seconds)
         return UInt64(clamped * 1_000_000_000)
+    }
+
+    private static func estimatedTokenCount(in value: String) -> Int {
+        wordCount(in: value)
+    }
+
+    private static func compressionRatio(inputTokenCount: Int, outputTokenCount: Int) -> Double? {
+        guard inputTokenCount > 0 else {
+            return nil
+        }
+        return Double(outputTokenCount) / Double(inputTokenCount)
+    }
+
+    private static func uniqueSourceNodeIDs(from queuedItems: [QueueItem]) -> [String] {
+        var seen: Set<String> = []
+        var orderedUniqueIDs: [String] = []
+
+        for item in queuedItems where !item.sourceNodeID.isEmpty {
+            if seen.insert(item.sourceNodeID).inserted {
+                orderedUniqueIDs.append(item.sourceNodeID)
+            }
+        }
+
+        return orderedUniqueIDs
     }
 
     private static func wordCount(in value: String) -> Int {

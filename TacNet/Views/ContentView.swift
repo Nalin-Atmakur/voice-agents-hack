@@ -80,6 +80,7 @@ struct ContentView: View {
                 TacNetTabShellView(
                     mainViewModel: appNetworkCoordinator.mainViewModel,
                     treeViewModel: appNetworkCoordinator.treeViewModel,
+                    dataFlowViewModel: appNetworkCoordinator.dataFlowViewModel,
                     onBackToRoleSelection: {
                         onboardingRoute = .roleSelection
                     }
@@ -869,6 +870,7 @@ enum TacNetTab: String, CaseIterable, Identifiable {
 private struct TacNetTabShellView: View {
     @ObservedObject var mainViewModel: MainViewModel
     @ObservedObject var treeViewModel: TreeViewModel
+    @ObservedObject var dataFlowViewModel: DataFlowViewModel
     let onBackToRoleSelection: () -> Void
 
     @State private var selectedTab: TacNetTab = .main
@@ -890,7 +892,7 @@ private struct TacNetTabShellView: View {
                 }
                 .tag(TacNetTab.treeView)
 
-            DataFlowView()
+            DataFlowView(viewModel: dataFlowViewModel)
                 .tabItem {
                     Label(TacNetTab.dataFlow.title, systemImage: TacNetTab.dataFlow.systemImage)
                 }
@@ -1234,23 +1236,276 @@ private struct TreeNodeStatusRowView: View {
     }
 }
 
-struct DataFlowView: View {
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 42))
-                .foregroundStyle(Color.accentColor)
-            Text("Data Flow")
-                .font(.title3.weight(.semibold))
-            Text("Incoming, processing, and outgoing message telemetry will appear here.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
+@MainActor
+final class DataFlowViewModel: ObservableObject {
+    struct IncomingEntry: Identifiable, Equatable {
+        var id: UUID { messageID }
+        let messageID: UUID
+        let timestamp: Date
+        let senderID: String
+        let senderRole: String
+        let typeLabel: String
+    }
+
+    struct OutgoingEntry: Identifiable, Equatable {
+        var id: UUID { messageID }
+        let messageID: UUID
+        let timestamp: Date
+        let destinationNodeID: String
+        let sourceNodeIDs: [String]
+        let outputText: String
+    }
+
+    struct ProcessingSnapshot: Equatable {
+        let status: CompactionEngine.ProcessingStatus
+        let triggerReason: CompactionEngine.TriggerReason?
+        let latencyMilliseconds: Double?
+        let inputTokenCount: Int
+        let outputTokenCount: Int
+        let compressionRatio: Double?
+        let sourceMessageCount: Int
+
+        static let idle = ProcessingSnapshot(
+            status: .idle,
+            triggerReason: nil,
+            latencyMilliseconds: nil,
+            inputTokenCount: 0,
+            outputTokenCount: 0,
+            compressionRatio: nil,
+            sourceMessageCount: 0
+        )
+
+        var statusLabel: String {
+            switch status {
+            case .idle:
+                return "Idle"
+            case .compacting:
+                return "Compacting"
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        var triggerReasonLabel: String {
+            guard let triggerReason else {
+                return "—"
+            }
+            switch triggerReason {
+            case .timeWindow:
+                return "Time Window"
+            case .messageCount:
+                return "Message Count"
+            case .priorityKeyword:
+                return "Priority Keyword"
+            case .manual:
+                return "Manual"
+            }
+        }
+
+        var latencyLabel: String {
+            guard let latencyMilliseconds else {
+                return "—"
+            }
+            return "\(Int(latencyMilliseconds.rounded())) ms"
+        }
+
+        var compressionRatioLabel: String {
+            guard let compressionRatio else {
+                return "—"
+            }
+            return String(format: "%.2fx", compressionRatio)
+        }
+    }
+
+    @Published private(set) var incomingEntries: [IncomingEntry] = []
+    @Published private(set) var outgoingEntries: [OutgoingEntry] = []
+    @Published private(set) var processing: ProcessingSnapshot = .idle
+
+    func handleIncomingMessage(_ message: Message) {
+        incomingEntries.append(
+            IncomingEntry(
+                messageID: message.id,
+                timestamp: message.timestamp,
+                senderID: message.senderID,
+                senderRole: message.senderRole,
+                typeLabel: message.type.rawValue
+            )
+        )
+        incomingEntries.sort { lhs, rhs in
+            lhs.timestamp > rhs.timestamp
+        }
+    }
+
+    func handleProcessingMetrics(_ metrics: CompactionEngine.ProcessingMetrics) {
+        processing = ProcessingSnapshot(
+            status: metrics.status,
+            triggerReason: metrics.triggerReason,
+            latencyMilliseconds: metrics.latencyMilliseconds,
+            inputTokenCount: metrics.inputTokenCount,
+            outputTokenCount: metrics.outputTokenCount,
+            compressionRatio: metrics.compressionRatio,
+            sourceMessageCount: metrics.sourceMessageCount
+        )
+    }
+
+    func handleOutgoingCompaction(_ emission: CompactionEngine.CompactionEmission) {
+        let trimmedOutput = emission.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedOutput.isEmpty else {
+            return
+        }
+
+        outgoingEntries.append(
+            OutgoingEntry(
+                messageID: emission.message.id,
+                timestamp: emission.generatedAt,
+                destinationNodeID: emission.destinationNodeID ?? "N/A",
+                sourceNodeIDs: emission.sourceNodeIDs,
+                outputText: trimmedOutput
+            )
+        )
+        outgoingEntries.sort { lhs, rhs in
+            lhs.timestamp > rhs.timestamp
+        }
+    }
+
+    func resetCompactionTelemetry() {
+        processing = .idle
+        outgoingEntries = []
+    }
+}
+
+struct DataFlowView: View {
+    @ObservedObject var viewModel: DataFlowViewModel
+
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter
+    }()
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                incomingSection
+                processingSection
+                outgoingSection
+            }
+            .padding(.horizontal)
+            .padding(.top, 4)
+            .padding(.bottom, 12)
+        }
         .navigationTitle("Data Flow")
         .accessibilityIdentifier("tacnet.dataflow.root")
+    }
+
+    private var incomingSection: some View {
+        GroupBox("INCOMING") {
+            VStack(alignment: .leading, spacing: 8) {
+                if viewModel.incomingEntries.isEmpty {
+                    Text("No received messages yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(viewModel.incomingEntries) { entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(entry.senderRole.isEmpty ? entry.senderID : entry.senderRole)
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer(minLength: 8)
+                                Text(Self.timestampFormatter.string(from: entry.timestamp))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            HStack(spacing: 8) {
+                                Text(entry.typeLabel)
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.blue)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.blue.opacity(0.15))
+                                    .clipShape(Capsule())
+                                Text(entry.senderID)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var processingSection: some View {
+        GroupBox("PROCESSING") {
+            VStack(alignment: .leading, spacing: 8) {
+                processingMetricRow(title: "Gemma 4 Status", value: viewModel.processing.statusLabel)
+                processingMetricRow(title: "Trigger Reason", value: viewModel.processing.triggerReasonLabel)
+                processingMetricRow(title: "Latency", value: viewModel.processing.latencyLabel)
+                processingMetricRow(title: "Input Tokens", value: "\(viewModel.processing.inputTokenCount)")
+                processingMetricRow(title: "Output Tokens", value: "\(viewModel.processing.outputTokenCount)")
+                processingMetricRow(title: "Compression Ratio", value: viewModel.processing.compressionRatioLabel)
+                processingMetricRow(title: "Source Messages", value: "\(viewModel.processing.sourceMessageCount)")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var outgoingSection: some View {
+        GroupBox("OUTGOING") {
+            VStack(alignment: .leading, spacing: 8) {
+                if viewModel.outgoingEntries.isEmpty {
+                    Text("No emitted compactions yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(viewModel.outgoingEntries) { entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Destination: \(entry.destinationNodeID)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer(minLength: 8)
+                                Text(Self.timestampFormatter.string(from: entry.timestamp))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Text("Source IDs: \(entry.sourceNodeIDs.isEmpty ? "—" : entry.sourceNodeIDs.joined(separator: ", "))")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+
+                            Text(entry.outputText)
+                                .font(.body)
+                                .foregroundStyle(.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func processingMetricRow(title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 10)
+            Text(value)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.primary)
+        }
     }
 }
 
@@ -1751,6 +2006,11 @@ final class AppNetworkCoordinator: ObservableObject {
     let roleClaimService: RoleClaimService
     let mainViewModel: MainViewModel
     let treeViewModel: TreeViewModel
+    let dataFlowViewModel: DataFlowViewModel
+
+    private var compactionEngine: CompactionEngine?
+    private var compactionEngineNodeID: String?
+    private var cancellables: Set<AnyCancellable> = []
 
     init(
         meshService: BluetoothMeshService = BluetoothMeshService(),
@@ -1774,12 +2034,31 @@ final class AppNetworkCoordinator: ObservableObject {
             roleClaimService: roleClaimService,
             localDeviceID: localDeviceID
         )
+        dataFlowViewModel = DataFlowViewModel()
+
+        roleClaimService.$networkConfig
+            .combineLatest(roleClaimService.$activeClaimNodeID)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] config, activeClaimNodeID in
+                self?.configureCompactionEngine(
+                    networkConfig: config,
+                    activeClaimNodeID: activeClaimNodeID
+                )
+            }
+            .store(in: &cancellables)
+
+        configureCompactionEngine(
+            networkConfig: roleClaimService.networkConfig,
+            activeClaimNodeID: roleClaimService.activeClaimNodeID
+        )
 
         meshService.onMessageReceived = { [weak self] message in
             Task { @MainActor in
                 self?.roleClaimService.handleIncomingMessage(message)
                 self?.mainViewModel.handleIncomingMessage(message)
                 self?.treeViewModel.handleIncomingMessage(message)
+                self?.dataFlowViewModel.handleIncomingMessage(message)
+                self?.handleCompactionPipeline(for: message)
             }
         }
 
@@ -1800,6 +2079,129 @@ final class AppNetworkCoordinator: ObservableObject {
     func activateRoleClaiming(with config: NetworkConfig) {
         treeSyncService.setLocalConfig(config)
         meshService.start()
+    }
+
+    private func configureCompactionEngine(
+        networkConfig: NetworkConfig?,
+        activeClaimNodeID: String?
+    ) {
+        guard let networkConfig else {
+            compactionEngine = nil
+            compactionEngineNodeID = nil
+            dataFlowViewModel.resetCompactionTelemetry()
+            return
+        }
+
+        let resolvedLocalNodeID = activeClaimNodeID
+            ?? findNodeID(claimedBy: localDeviceID, in: networkConfig.tree)
+
+        guard let resolvedLocalNodeID,
+              let localNode = findNode(withID: resolvedLocalNodeID, in: networkConfig.tree) else {
+            compactionEngine = nil
+            compactionEngineNodeID = nil
+            dataFlowViewModel.resetCompactionTelemetry()
+            return
+        }
+
+        if compactionEngineNodeID == resolvedLocalNodeID,
+           let compactionEngine {
+            Task {
+                await compactionEngine.updateTree(networkConfig.tree)
+            }
+            return
+        }
+
+        let engine = CompactionEngine(
+            localDeviceID: localDeviceID,
+            localNodeID: resolvedLocalNodeID,
+            localSenderRole: localNode.label,
+            initialTree: networkConfig.tree
+        )
+        compactionEngine = engine
+        compactionEngineNodeID = resolvedLocalNodeID
+        dataFlowViewModel.resetCompactionTelemetry()
+
+        Task {
+            await engine.setProcessingObserver { [weak self] metrics in
+                Task { @MainActor in
+                    self?.dataFlowViewModel.handleProcessingMetrics(metrics)
+                }
+            }
+
+            await engine.setCompactionEmissionObserver { [weak self] emission in
+                Task { @MainActor in
+                    guard let self else {
+                        return
+                    }
+                    self.dataFlowViewModel.handleOutgoingCompaction(emission)
+                    self.meshService.publish(emission.message)
+                }
+            }
+        }
+    }
+
+    private func handleCompactionPipeline(for message: Message) {
+        guard let compactionEngine,
+              let tree = roleClaimService.networkConfig?.tree,
+              let senderNodeID = resolveSenderNodeID(for: message, in: tree) else {
+            return
+        }
+
+        switch message.type {
+        case .broadcast:
+            guard let transcript = message.payload.transcript?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !transcript.isEmpty else {
+                return
+            }
+            Task {
+                await compactionEngine.enqueueChildTranscript(transcript, from: senderNodeID)
+            }
+
+        case .compaction:
+            guard let summary = message.payload.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !summary.isEmpty else {
+                return
+            }
+            Task {
+                await compactionEngine.enqueueL1CompactionSummary(summary, from: senderNodeID)
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func resolveSenderNodeID(for message: Message, in tree: TreeNode) -> String? {
+        if TreeHelpers.level(of: message.senderID, in: tree) != nil {
+            return message.senderID
+        }
+        return findNodeID(claimedBy: message.senderID, in: tree)
+    }
+
+    private func findNodeID(claimedBy ownerID: String, in tree: TreeNode) -> String? {
+        if tree.claimedBy == ownerID {
+            return tree.id
+        }
+
+        for child in tree.children {
+            if let nodeID = findNodeID(claimedBy: ownerID, in: child) {
+                return nodeID
+            }
+        }
+        return nil
+    }
+
+    private func findNode(withID nodeID: String, in tree: TreeNode) -> TreeNode? {
+        if tree.id == nodeID {
+            return tree
+        }
+
+        for child in tree.children {
+            if let node = findNode(withID: nodeID, in: child) {
+                return node
+            }
+        }
+        return nil
     }
 }
 

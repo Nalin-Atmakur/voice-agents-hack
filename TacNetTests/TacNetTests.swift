@@ -1716,6 +1716,150 @@ final class TacNetTests: XCTestCase {
     }
 
     @MainActor
+    func testDataFlowViewModelIncomingSectionListsReceivedMessagesWithMetadata() {
+        let viewModel = DataFlowViewModel()
+        let olderTimestamp = Date(timeIntervalSince1970: 1_700_800_010)
+        let newerTimestamp = Date(timeIntervalSince1970: 1_700_800_050)
+
+        let olderMessage = Message.make(
+            id: UUID(uuidString: "AAAA0000-1111-2222-3333-444444444444")!,
+            type: .claim,
+            senderID: "alpha-device",
+            senderRole: "Alpha Lead",
+            parentID: "root",
+            treeLevel: 1,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            timestamp: olderTimestamp
+        )
+        let newerMessage = Message.make(
+            id: UUID(uuidString: "BBBB0000-1111-2222-3333-444444444444")!,
+            type: .compaction,
+            senderID: "bravo-1",
+            senderRole: "Bravo 1",
+            parentID: "bravo",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            summary: "Bravo compaction summary",
+            timestamp: newerTimestamp
+        )
+
+        viewModel.handleIncomingMessage(olderMessage)
+        viewModel.handleIncomingMessage(newerMessage)
+
+        XCTAssertEqual(viewModel.incomingEntries.count, 2)
+        XCTAssertEqual(viewModel.incomingEntries.map(\.messageID), [newerMessage.id, olderMessage.id])
+        XCTAssertEqual(viewModel.incomingEntries.map(\.senderRole), ["Bravo 1", "Alpha Lead"])
+        XCTAssertEqual(viewModel.incomingEntries.map(\.senderID), ["bravo-1", "alpha-device"])
+        XCTAssertEqual(viewModel.incomingEntries.map(\.typeLabel), ["COMPACTION", "CLAIM"])
+        XCTAssertEqual(viewModel.incomingEntries.map(\.timestamp), [newerTimestamp, olderTimestamp])
+    }
+
+    @MainActor
+    func testDataFlowViewModelProcessingSectionShowsStatusAndAIMetricsWithinOneSecond() async throws {
+        let viewModel = DataFlowViewModel()
+        let summarizer = MockTacticalSummarizer(
+            outputs: ["Alpha summary output with casualty and route update."],
+            delayNanoseconds: 220_000_000
+        )
+        let engine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "alpha-lead",
+            tree: makeFixtureTree(),
+            summarizer: summarizer,
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+
+        await engine.setProcessingObserver { metrics in
+            Task { @MainActor in
+                viewModel.handleProcessingMetrics(metrics)
+            }
+        }
+
+        let enqueueTask = Task {
+            await engine.enqueueChildTranscript(
+                "Alpha-1 reports two hostiles near checkpoint east and route blocked by debris.",
+                from: "alpha-1"
+            )
+        }
+
+        let compactingObserved = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                viewModel.processing.status == .compacting &&
+                    viewModel.processing.triggerReason == .messageCount
+            }
+        }
+        XCTAssertTrue(compactingObserved, "Expected compacting status within one second")
+
+        await enqueueTask.value
+
+        let idleObserved = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                viewModel.processing.status == .idle &&
+                    viewModel.processing.latencyMilliseconds != nil
+            }
+        }
+        XCTAssertTrue(idleObserved, "Expected idle status with latency metrics within one second")
+
+        XCTAssertEqual(viewModel.processing.triggerReason, .messageCount)
+        XCTAssertGreaterThan(viewModel.processing.inputTokenCount, 0)
+        XCTAssertGreaterThan(viewModel.processing.outputTokenCount, 0)
+        XCTAssertNotNil(viewModel.processing.compressionRatio)
+        XCTAssertGreaterThan(viewModel.processing.latencyMilliseconds ?? 0, 0)
+    }
+
+    @MainActor
+    func testDataFlowViewModelOutgoingSectionListsEveryEmittedCompaction() async throws {
+        let viewModel = DataFlowViewModel()
+        let summarizer = MockTacticalSummarizer(
+            outputs: [
+                "First emitted compaction output.",
+                "Second emitted compaction output."
+            ]
+        )
+        let engine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "alpha-lead",
+            tree: makeFixtureTree(),
+            summarizer: summarizer,
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+
+        await engine.setCompactionEmissionObserver { emission in
+            Task { @MainActor in
+                viewModel.handleOutgoingCompaction(emission)
+            }
+        }
+
+        await engine.enqueueChildTranscript("Alpha-1 contact at grid seven.", from: "alpha-1")
+        await engine.enqueueChildTranscript("Alpha-2 route secure at grid eight.", from: "alpha-2")
+
+        let outgoingObserved = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                viewModel.outgoingEntries.count == 2
+            }
+        }
+        XCTAssertTrue(outgoingObserved, "Expected outgoing compaction entries within one second")
+
+        XCTAssertEqual(viewModel.outgoingEntries.count, 2)
+        XCTAssertEqual(viewModel.outgoingEntries[0].destinationNodeID, "root")
+        XCTAssertEqual(viewModel.outgoingEntries[0].sourceNodeIDs, ["alpha-2"])
+        XCTAssertEqual(viewModel.outgoingEntries[0].outputText, "Second emitted compaction output.")
+        XCTAssertEqual(viewModel.outgoingEntries[1].destinationNodeID, "root")
+        XCTAssertEqual(viewModel.outgoingEntries[1].sourceNodeIDs, ["alpha-1"])
+        XCTAssertEqual(viewModel.outgoingEntries[1].outputText, "First emitted compaction output.")
+    }
+
+    @MainActor
     func testTreeViewModelBuildsHierarchyAndShowsClaimedByLabels() {
         let transport = MockBluetoothMeshTransport()
         let meshService = BluetoothMeshService(transport: transport, deduplicator: MessageDeduplicator(capacity: 1_000))
