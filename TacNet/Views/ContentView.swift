@@ -3,6 +3,7 @@ import Combine
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var bootstrapViewModel = AppBootstrapViewModel()
     @StateObject private var treeBuilderViewModel = TreeBuilderViewModel(
         createdBy: ProcessInfo.processInfo.hostName
@@ -28,6 +29,9 @@ struct ContentView: View {
         }
         .task {
             bootstrapViewModel.startIfNeeded()
+        }
+        .onChange(of: scenePhase) { phase in
+            appNetworkCoordinator.handleScenePhase(phase)
         }
     }
 
@@ -2791,6 +2795,14 @@ final class MainViewModel: ObservableObject {
 
 @MainActor
 final class AppNetworkCoordinator: ObservableObject {
+    typealias CompactionEngineFactory = (
+        _ localDeviceID: String,
+        _ localNodeID: String,
+        _ localSenderRole: String,
+        _ initialTree: TreeNode,
+        _ messageRouter: MessageRouter
+    ) -> CompactionEngine
+
     let localDeviceID: String
     let meshService: BluetoothMeshService
     let discoveryService: NetworkDiscoveryService
@@ -2802,16 +2814,31 @@ final class AppNetworkCoordinator: ObservableObject {
     let settingsViewModel: SettingsViewModel
     let afterActionReviewViewModel: AfterActionReviewViewModel
 
+    private let messageRouter: MessageRouter
+    private let compactionEngineFactory: CompactionEngineFactory
     private var compactionEngine: CompactionEngine?
     private var compactionEngineNodeID: String?
     private var cancellables: Set<AnyCancellable> = []
 
     init(
         meshService: BluetoothMeshService = BluetoothMeshService(),
-        localDeviceID: String = ProcessInfo.processInfo.hostName
+        localDeviceID: String = ProcessInfo.processInfo.hostName,
+        messageRouter: MessageRouter = MessageRouter(),
+        mainAudioService: AudioService = AudioService(),
+        compactionEngineFactory: @escaping CompactionEngineFactory = { localDeviceID, localNodeID, localSenderRole, initialTree, messageRouter in
+            CompactionEngine(
+                localDeviceID: localDeviceID,
+                localNodeID: localNodeID,
+                localSenderRole: localSenderRole,
+                initialTree: initialTree,
+                messageRouter: messageRouter
+            )
+        }
     ) {
         self.localDeviceID = localDeviceID
         self.meshService = meshService
+        self.messageRouter = messageRouter
+        self.compactionEngineFactory = compactionEngineFactory
 
         let reviewStore: any AfterActionReviewPersisting
         if #available(iOS 17.0, *) {
@@ -2834,7 +2861,9 @@ final class AppNetworkCoordinator: ObservableObject {
         mainViewModel = MainViewModel(
             meshService: meshService,
             roleClaimService: roleClaimService,
-            localDeviceID: localDeviceID
+            localDeviceID: localDeviceID,
+            messageRouter: messageRouter,
+            audioService: mainAudioService
         )
         treeViewModel = TreeViewModel(
             roleClaimService: roleClaimService,
@@ -2896,6 +2925,24 @@ final class AppNetworkCoordinator: ObservableObject {
         meshService.start()
     }
 
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            meshService.start()
+            mainViewModel.refreshConnectionState()
+        case .inactive, .background:
+            guard let compactionEngine else {
+                return
+            }
+            Task {
+                await compactionEngine.flushQueuedChildTranscripts()
+                await compactionEngine.flushQueuedL1Compactions()
+            }
+        @unknown default:
+            break
+        }
+    }
+
     private func configureCompactionEngine(
         networkConfig: NetworkConfig?,
         activeClaimNodeID: String?
@@ -2926,11 +2973,12 @@ final class AppNetworkCoordinator: ObservableObject {
             return
         }
 
-        let engine = CompactionEngine(
-            localDeviceID: localDeviceID,
-            localNodeID: resolvedLocalNodeID,
-            localSenderRole: localNode.label,
-            initialTree: networkConfig.tree
+        let engine = compactionEngineFactory(
+            localDeviceID,
+            resolvedLocalNodeID,
+            localNode.label,
+            networkConfig.tree,
+            messageRouter
         )
         compactionEngine = engine
         compactionEngineNodeID = resolvedLocalNodeID

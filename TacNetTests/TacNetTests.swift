@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import TacNet
 
 final class TacNetTests: XCTestCase {
@@ -3184,6 +3185,878 @@ final class TacNetTests: XCTestCase {
         XCTAssertTrue(rootEmissions.isEmpty, "Root should produce SITREP, not upward compaction messages")
     }
 
+    // VAL-CROSS-001
+    @MainActor
+    func testCrossAreaFirstTimeJourneyDownloadInitJoinPTTAndTranscriptDeliveryWithinFiveSeconds() async throws {
+        let startedAt = Date()
+
+        let sandbox = try makeModelDownloadSandbox()
+        defer { sandbox.cleanup() }
+
+        let temporaryModelFile = try makeTemporaryModelFile(in: sandbox.baseDirectory)
+        let downloadService = makeModelDownloadService(
+            sandbox: sandbox,
+            downloader: MockURLSessionDownloadClient(
+                scriptedResponses: [
+                    .init(
+                        progressEvents: [(100, 1_000), (500, 1_000), (1_000, 1_000)],
+                        result: .success(temporaryModelFile)
+                    )
+                ]
+            ),
+            availableStorageBytes: 20_000_000_000
+        )
+
+        _ = try await downloadService.ensureModelAvailable()
+        let initializer = CactusModelInitializationService(
+            downloadService: downloadService,
+            initFunction: { _, _, _ in
+                UnsafeMutableRawPointer(bitPattern: 0xBEEF)!
+            },
+            destroyFunction: { _ in }
+        )
+        _ = try await initializer.initializeModel()
+
+        let organiserPeerID = UUID(uuidString: "10101010-0000-0000-0000-000000000001")!
+        let networkID = UUID(uuidString: "10101010-0000-0000-0000-000000000002")!
+
+        let organiserTransport = MockBluetoothMeshTransport()
+        let organiserMesh = BluetoothMeshService(
+            transport: organiserTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let organiserSync = TreeSyncService(meshService: organiserMesh)
+
+        var publishedConfig = NetworkConfig(
+            networkName: "Cross First Time",
+            networkID: networkID,
+            createdBy: "organiser-device",
+            pinHash: nil,
+            version: 1,
+            tree: makeFixtureTree()
+        )
+        publishedConfig = organiserSync.secureConfigForPublishing(publishedConfig)
+        organiserSync.setLocalConfig(publishedConfig)
+
+        let participantTransport = MockBluetoothMeshTransport()
+        participantTransport.setTreeConfig(publishedConfig, for: organiserPeerID)
+        let participantMesh = BluetoothMeshService(
+            transport: participantTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let participantSync = TreeSyncService(meshService: participantMesh)
+
+        let discoveredNetwork = DiscoveredNetwork(
+            peerID: organiserPeerID,
+            networkID: networkID,
+            networkName: "Cross First Time",
+            openSlotCount: publishedConfig.openSlotCount,
+            requiresPIN: false
+        )
+        let joinedConfig = try await participantSync.join(network: discoveredNetwork, pin: nil)
+        XCTAssertEqual(joinedConfig.networkID, networkID)
+
+        var routedConfig = joinedConfig
+        _ = mutateClaim(nodeID: "alpha", claimedBy: "local-device", in: &routedConfig.tree)
+        _ = mutateClaim(nodeID: "bravo", claimedBy: "peer-device", in: &routedConfig.tree)
+
+        let senderTransport = MockBluetoothMeshTransport()
+        let senderMesh = BluetoothMeshService(
+            transport: senderTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let senderSync = TreeSyncService(meshService: senderMesh)
+        senderSync.setLocalConfig(routedConfig)
+        let senderRoleService = RoleClaimService(
+            meshService: senderMesh,
+            treeSyncService: senderSync,
+            localDeviceID: "local-device",
+            disconnectTimeout: 60
+        )
+        let senderAudio = AudioService(
+            capturer: MockAudioCapturer(clips: [makeAlternatingPCMClip(sampleCount: 360, amplitude: 1_200)]),
+            transcriber: MockCactusTranscriber(
+                results: ["Alpha says contact east"],
+                delayNanoseconds: 80_000_000
+            ),
+            maxRecordingDuration: 60
+        )
+        let senderMainViewModel = MainViewModel(
+            meshService: senderMesh,
+            roleClaimService: senderRoleService,
+            localDeviceID: "local-device",
+            audioService: senderAudio
+        )
+
+        let receiverMesh = BluetoothMeshService(
+            transport: MockBluetoothMeshTransport(),
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let receiverSync = TreeSyncService(meshService: receiverMesh)
+        receiverSync.setLocalConfig(routedConfig)
+        let receiverRoleService = RoleClaimService(
+            meshService: receiverMesh,
+            treeSyncService: receiverSync,
+            localDeviceID: "peer-device",
+            disconnectTimeout: 60
+        )
+        let receiverMainViewModel = MainViewModel(
+            meshService: receiverMesh,
+            roleClaimService: receiverRoleService,
+            localDeviceID: "peer-device",
+            audioService: AudioService(
+                capturer: MockAudioCapturer(clips: []),
+                transcriber: MockCactusTranscriber(results: []),
+                maxRecordingDuration: 60
+            )
+        )
+
+        let connectedPeerID = UUID(uuidString: "10101010-0000-0000-0000-000000000099")!
+        senderTransport.emit(.connectionStateChanged(connectedPeerID, .connected))
+        senderMainViewModel.handlePeerConnectionStateChanged(peerID: connectedPeerID, state: .connected)
+
+        await senderMainViewModel.startPushToTalk()
+        await senderMainViewModel.stopPushToTalk()
+
+        let outboundPacket = try XCTUnwrap(senderTransport.sentPackets.first)
+        let outboundMessage = try decodeMessage(from: outboundPacket.data)
+        receiverMainViewModel.handleIncomingMessage(outboundMessage)
+
+        XCTAssertEqual(receiverMainViewModel.feedEntries.count, 1)
+        XCTAssertEqual(receiverMainViewModel.feedEntries.first?.text, "Alpha says contact east")
+        XCTAssertLessThanOrEqual(Date().timeIntervalSince(startedAt), 5.0)
+    }
+
+    // VAL-CROSS-002
+    func testCrossAreaFullCommunicationCycleLeafToRootSitrepAndNoGrandparentRawLeak() async throws {
+        let tree = makeFixtureTree()
+        let router = MessageRouter()
+        let leafBroadcast = router.makeBroadcastMessage(
+            transcript: "Alpha-1 contact at ridge line.",
+            senderID: "alpha-1-device",
+            senderNodeID: "alpha-1",
+            senderRole: "Alpha 1",
+            in: tree
+        )
+
+        XCTAssertTrue(router.shouldDisplay(leafBroadcast, for: "alpha", in: tree))
+        XCTAssertTrue(router.shouldDisplay(leafBroadcast, for: "alpha-2", in: tree))
+        XCTAssertFalse(router.shouldDisplay(leafBroadcast, for: "root", in: tree))
+
+        let parentEngine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "Alpha Lead",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["Alpha summary: contact at ridge, team holding."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+        await parentEngine.enqueueChildTranscript(
+            leafBroadcast.payload.transcript ?? "",
+            from: "alpha-1"
+        )
+        let parentCompactions = await parentEngine.emittedCompactions()
+        let parentCompaction = try XCTUnwrap(parentCompactions.first)
+        XCTAssertEqual(parentCompaction.message.type, .compaction)
+        XCTAssertEqual(parentCompaction.message.parentID, "root")
+
+        let rootEngine = makeCompactionEngine(
+            localNodeID: "root",
+            localDeviceID: "root-device",
+            localRole: "Commander",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["SITREP: Alpha contact ridge, holding position."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+        await rootEngine.enqueueL1CompactionSummary(
+            parentCompaction.message.payload.summary ?? "",
+            from: "alpha"
+        )
+        let rootSitrep = await rootEngine.latestSITREP()
+        let sitrep = try XCTUnwrap(rootSitrep)
+        XCTAssertFalse(sitrep.text.isEmpty)
+    }
+
+    // VAL-CROSS-003
+    @MainActor
+    func testCrossAreaTreeRestructureMidOperationReparentUpdatesRouting() throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(
+            transport: transport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let treeSyncService = TreeSyncService(meshService: meshService)
+
+        var config = NetworkConfig(
+            networkName: "Cross Reparent",
+            networkID: UUID(uuidString: "30303030-0000-0000-0000-000000000001")!,
+            createdBy: "organiser-device",
+            pinHash: nil,
+            version: 1,
+            tree: makeFixtureTree()
+        )
+        _ = mutateClaim(nodeID: "alpha-1", claimedBy: "alpha-1-device", in: &config.tree)
+        treeSyncService.setLocalConfig(config)
+
+        let roleService = RoleClaimService(
+            meshService: meshService,
+            treeSyncService: treeSyncService,
+            localDeviceID: "organiser-device",
+            disconnectTimeout: 60
+        )
+        XCTAssertTrue(roleService.moveNode(nodeID: "alpha-1", newParentID: "bravo"))
+
+        let updatedTree = try XCTUnwrap(treeSyncService.localConfig?.tree)
+        let router = MessageRouter()
+        let postMoveBroadcast = router.makeBroadcastMessage(
+            transcript: "Routed after reparent.",
+            senderID: "alpha-1-device",
+            senderNodeID: "alpha-1",
+            senderRole: "Alpha 1",
+            in: updatedTree
+        )
+
+        XCTAssertEqual(postMoveBroadcast.parentID, "bravo")
+        XCTAssertTrue(router.shouldDisplay(postMoveBroadcast, for: "bravo", in: updatedTree))
+        XCTAssertFalse(router.shouldDisplay(postMoveBroadcast, for: "alpha", in: updatedTree))
+    }
+
+    // VAL-CROSS-004
+    @MainActor
+    func testCrossAreaNodeFailureRecoveryAutoReparentResumesCompactionRouting() async throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(
+            transport: transport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let treeSyncService = TreeSyncService(meshService: meshService, disconnectTimeout: 0.05)
+
+        let forwardingPeer = UUID(uuidString: "40404040-0000-0000-0000-000000000001")!
+        let rootPeer = UUID(uuidString: "40404040-0000-0000-0000-000000000002")!
+        let alphaPeer = UUID(uuidString: "40404040-0000-0000-0000-000000000003")!
+        let bravoPeer = UUID(uuidString: "40404040-0000-0000-0000-000000000004")!
+        let charliePeer = UUID(uuidString: "40404040-0000-0000-0000-000000000005")!
+
+        [forwardingPeer, rootPeer, alphaPeer, bravoPeer, charliePeer].forEach {
+            transport.emit(.connectionStateChanged($0, .connected))
+        }
+
+        let config = makeAutoReparentNetworkConfig(
+            networkID: UUID(uuidString: "40404040-0000-0000-0000-000000000006")!,
+            version: 50,
+            rootOwnerID: rootPeer.uuidString,
+            alphaOwnerID: alphaPeer.uuidString,
+            bravoOwnerID: bravoPeer.uuidString,
+            charlieOwnerID: charliePeer.uuidString
+        )
+        treeSyncService.setLocalConfig(config)
+
+        transport.emit(.connectionStateChanged(bravoPeer, .disconnected))
+        treeSyncService.handlePeerStateChange(peerID: bravoPeer, state: .disconnected)
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        let updatedTree = try XCTUnwrap(treeSyncService.localConfig?.tree)
+        XCTAssertEqual(TreeHelpers.parent(of: "charlie", in: updatedTree)?.id, "alpha")
+
+        let routedMessage = MessageRouter().makeCompactionMessage(
+            summary: "Charlie resumed reporting after failover.",
+            senderID: "charlie-device",
+            senderNodeID: "charlie",
+            senderRole: "Charlie",
+            in: updatedTree
+        )
+        XCTAssertEqual(routedMessage.parentID, "alpha")
+    }
+
+    // VAL-CROSS-005
+    @MainActor
+    func testCrossAreaOrganiserHandoverAllowsNewOrganiserEditAndPropagation() throws {
+        let oldTransport = MockBluetoothMeshTransport()
+        let oldMesh = BluetoothMeshService(
+            transport: oldTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let oldSync = TreeSyncService(meshService: oldMesh)
+        let forwardingPeer = UUID(uuidString: "50505050-0000-0000-0000-000000000001")!
+        oldTransport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        var config = NetworkConfig(
+            networkName: "Cross Handover",
+            networkID: UUID(uuidString: "50505050-0000-0000-0000-000000000002")!,
+            createdBy: "old-organiser-device",
+            pinHash: nil,
+            version: 5,
+            tree: makeFixtureTree()
+        )
+        _ = mutateClaim(nodeID: "alpha", claimedBy: "new-organiser-device", in: &config.tree)
+        oldSync.setLocalConfig(config)
+
+        let oldRoleService = RoleClaimService(
+            meshService: oldMesh,
+            treeSyncService: oldSync,
+            localDeviceID: "old-organiser-device",
+            disconnectTimeout: 60
+        )
+        XCTAssertTrue(oldRoleService.promote(nodeID: "alpha"))
+
+        let promoteMessage = try XCTUnwrap(
+            oldTransport.sentPackets
+                .compactMap { try? decodeMessage(from: $0.data) }
+                .first(where: { $0.type == .promote })
+        )
+
+        let newTransport = MockBluetoothMeshTransport()
+        let newMesh = BluetoothMeshService(
+            transport: newTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let newSync = TreeSyncService(meshService: newMesh)
+        let propagationPeer = UUID(uuidString: "50505050-0000-0000-0000-000000000003")!
+        newTransport.emit(.connectionStateChanged(propagationPeer, .connected))
+        newSync.setLocalConfig(config)
+        let newRoleService = RoleClaimService(
+            meshService: newMesh,
+            treeSyncService: newSync,
+            localDeviceID: "new-organiser-device",
+            disconnectTimeout: 60
+        )
+
+        newRoleService.handleIncomingMessage(promoteMessage)
+        XCTAssertTrue(newRoleService.isOrganiser)
+        XCTAssertTrue(newRoleService.renameNode(nodeID: "alpha", newLabel: "Alpha Command"))
+
+        let propagatedUpdate = try XCTUnwrap(
+            newTransport.sentPackets
+                .compactMap { try? decodeMessage(from: $0.data) }
+                .first(where: { $0.type == .treeUpdate })
+        )
+        oldRoleService.handleIncomingMessage(propagatedUpdate)
+
+        let oldTree = try XCTUnwrap(oldSync.localConfig?.tree)
+        XCTAssertEqual(findNode(nodeID: "alpha", in: oldTree)?.label, "Alpha Command")
+    }
+
+    // VAL-CROSS-006
+    @MainActor
+    func testCrossAreaAfterActionReviewSearchReturnsBroadcastAndCompactionWithMetadata() {
+        let store = InMemoryAfterActionReviewStore()
+        let viewModel = AfterActionReviewViewModel(store: store)
+
+        viewModel.record(
+            Message.make(
+                type: .broadcast,
+                senderID: "leaf-device",
+                senderRole: "Leaf",
+                parentID: "alpha",
+                treeLevel: 2,
+                ttl: 4,
+                encrypted: false,
+                latitude: 34.001,
+                longitude: -117.001,
+                accuracy: 3.1,
+                transcript: "Casualty reported near checkpoint."
+            )
+        )
+        viewModel.record(
+            Message.make(
+                type: .compaction,
+                senderID: "alpha-device",
+                senderRole: "Alpha Lead",
+                parentID: "root",
+                treeLevel: 1,
+                ttl: 4,
+                encrypted: false,
+                latitude: 34.002,
+                longitude: -117.002,
+                accuracy: 4.2,
+                summary: "Casualty stabilized and extraction requested."
+            )
+        )
+
+        viewModel.query = "casualty"
+        XCTAssertEqual(viewModel.results.count, 2)
+        XCTAssertEqual(Set(viewModel.results.map(\.type)), [.broadcast, .compaction])
+        XCTAssertTrue(viewModel.results.allSatisfy { !$0.senderRole.isEmpty })
+        XCTAssertTrue(viewModel.results.allSatisfy { $0.timestamp.timeIntervalSince1970 > 0 })
+    }
+
+    // VAL-CROSS-007
+    func testCrossAreaDemoScenarioSection14CompletesWithinTwoMinutes() async throws {
+        let start = Date()
+        let tree = makeFixtureTree()
+
+        let alphaEngine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "Alpha Lead",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["Alpha compaction: contact east, one casualty."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+        let charlieEngine = makeCompactionEngine(
+            localNodeID: "charlie",
+            localDeviceID: "charlie-device",
+            localRole: "Charlie Lead",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["Charlie compaction: route secure, moving north."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+        let rootEngine = makeCompactionEngine(
+            localNodeID: "root",
+            localDeviceID: "root-device",
+            localRole: "Commander",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["SITREP: Alpha contact/casualty, Bravo route secure."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 2, defaultTTL: 8)
+        )
+
+        await alphaEngine.enqueueChildTranscript("Alpha-1: contact and casualty at east ridge.", from: "alpha-1")
+        await charlieEngine.enqueueChildTranscript("Charlie-1: route secure, advancing.", from: "charlie-1")
+
+        let alphaCompactions = await alphaEngine.emittedCompactions()
+        let charlieCompactions = await charlieEngine.emittedCompactions()
+        let alphaCompaction = try XCTUnwrap(alphaCompactions.first)
+        let charlieCompaction = try XCTUnwrap(charlieCompactions.first)
+
+        await rootEngine.enqueueL1CompactionSummary(alphaCompaction.outputText, from: "alpha")
+        await rootEngine.enqueueL1CompactionSummary(charlieCompaction.outputText, from: "charlie")
+        let rootSitrep = await rootEngine.latestSITREP()
+        let sitrep = try XCTUnwrap(rootSitrep)
+        XCTAssertFalse(sitrep.text.isEmpty)
+
+        XCTAssertLessThanOrEqual(Date().timeIntervalSince(start), 120.0)
+    }
+
+    // VAL-CROSS-008
+    @MainActor
+    func testCrossAreaEncryptedCommunicationLateJoinerCanDecryptMessages() async throws {
+        let organiserTransport = MockBluetoothMeshTransport()
+        let organiserMesh = BluetoothMeshService(
+            transport: organiserTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let organiserSync = TreeSyncService(meshService: organiserMesh)
+
+        let networkID = UUID(uuidString: "80808080-0000-0000-0000-000000000001")!
+        var securedConfig = NetworkConfig(
+            networkName: "Encrypted Cross",
+            networkID: networkID,
+            createdBy: "organiser-device",
+            pinHash: NetworkConfig.hashPIN("1234"),
+            version: 1,
+            tree: makeFixtureTree()
+        )
+        securedConfig = organiserSync.secureConfigForPublishing(securedConfig)
+        organiserSync.setLocalConfig(securedConfig)
+
+        let organiserPeerID = UUID(uuidString: "80808080-0000-0000-0000-000000000002")!
+        let lateJoinerPeerID = UUID(uuidString: "80808080-0000-0000-0000-000000000003")!
+
+        let lateTransport = MockBluetoothMeshTransport()
+        lateTransport.setTreeConfig(securedConfig, for: organiserPeerID)
+        let lateMesh = BluetoothMeshService(
+            transport: lateTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let lateSync = TreeSyncService(meshService: lateMesh)
+
+        let discovered = DiscoveredNetwork(
+            peerID: organiserPeerID,
+            networkID: networkID,
+            networkName: securedConfig.networkName,
+            openSlotCount: securedConfig.openSlotCount,
+            requiresPIN: true
+        )
+        _ = try await lateSync.join(network: discovered, pin: "1234")
+
+        organiserTransport.emit(.connectionStateChanged(lateJoinerPeerID, .connected))
+
+        let receivedByLateJoiner = LockedArray<Message>()
+        lateMesh.onMessageReceived = { receivedByLateJoiner.append($0) }
+
+        let plaintextTranscript = "encrypted contact report"
+        let outbound = Message.make(
+            type: .broadcast,
+            senderID: "organiser-device",
+            senderRole: "organiser",
+            parentID: "root",
+            treeLevel: 1,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: plaintextTranscript
+        )
+        organiserMesh.publish(outbound)
+
+        let encryptedPacket = try XCTUnwrap(organiserTransport.sentPackets.first)
+        XCTAssertNil(encryptedPacket.data.range(of: Data(plaintextTranscript.utf8)))
+
+        lateTransport.emit(.receivedData(encryptedPacket.data, from: organiserPeerID))
+
+        let didDecrypt = await waitForCondition(timeout: 1.0) {
+            receivedByLateJoiner.values.last?.payload.transcript == plaintextTranscript
+        }
+        XCTAssertTrue(didDecrypt)
+        XCTAssertEqual(receivedByLateJoiner.values.last?.payload.encrypted, true)
+    }
+
+    // VAL-CROSS-009
+    func testCrossAreaPriorityEscalationEndToEndBypassesNormalCycle() async throws {
+        let tree = makeFixtureTree()
+        let parentEngine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "Alpha Lead",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["Casualty at grid five; immediate medevac."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 10, defaultTTL: 8)
+        )
+        await parentEngine.enqueueChildTranscript("Alpha-1 reports CASUALTY at grid five.", from: "alpha-1")
+        let parentEmissions = await parentEngine.emittedCompactions()
+        let parentEmission = try XCTUnwrap(parentEmissions.first)
+        XCTAssertEqual(parentEmission.triggerReason, .priorityKeyword)
+
+        let rootEngine = makeCompactionEngine(
+            localNodeID: "root",
+            localDeviceID: "root-device",
+            localRole: "Commander",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["SITREP priority: casualty at grid five."]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 10, defaultTTL: 8)
+        )
+        await rootEngine.enqueueL1CompactionSummary(parentEmission.outputText, from: "alpha")
+        let rootSitrep = await rootEngine.latestSITREP()
+        let sitrep = try XCTUnwrap(rootSitrep)
+        XCTAssertEqual(sitrep.triggerReason, .priorityKeyword)
+
+        let normalRootEngine = makeCompactionEngine(
+            localNodeID: "root",
+            localDeviceID: "root-device",
+            localRole: "Commander",
+            tree: tree,
+            summarizer: MockTacticalSummarizer(outputs: ["Normal sitrep"]),
+            configuration: .init(timeWindow: 30, messageCountThreshold: 2, defaultTTL: 8)
+        )
+        await normalRootEngine.enqueueL1CompactionSummary("Routine status update.", from: "alpha")
+        let normalSitrep = await normalRootEngine.latestSITREP()
+        XCTAssertNil(normalSitrep)
+    }
+
+    // VAL-CROSS-010
+    @MainActor
+    func testCrossAreaDataFlowTransparencyDuringActiveCommunication() async throws {
+        let viewModel = DataFlowViewModel()
+        let summarizer = MockTacticalSummarizer(outputs: ["Compacted output for data flow visibility."])
+        let engine = makeCompactionEngine(
+            localNodeID: "alpha",
+            localDeviceID: "alpha-device",
+            localRole: "Alpha Lead",
+            tree: makeFixtureTree(),
+            summarizer: summarizer,
+            configuration: .init(timeWindow: 30, messageCountThreshold: 1, defaultTTL: 8)
+        )
+
+        await engine.setProcessingObserver { metrics in
+            Task { @MainActor in
+                viewModel.handleProcessingMetrics(metrics)
+            }
+        }
+        await engine.setCompactionEmissionObserver { emission in
+            Task { @MainActor in
+                viewModel.handleOutgoingCompaction(emission)
+            }
+        }
+
+        let incoming = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1-device",
+            senderRole: "Alpha 1",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Routine update at checkpoint"
+        )
+        viewModel.handleIncomingMessage(incoming)
+
+        await engine.enqueueChildTranscript("Routine update at checkpoint", from: "alpha-1")
+        let outgoingObserved = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                !viewModel.outgoingEntries.isEmpty
+            }
+        }
+        XCTAssertTrue(outgoingObserved)
+        XCTAssertFalse(viewModel.incomingEntries.isEmpty)
+        XCTAssertEqual(viewModel.processing.triggerReason, .messageCount)
+    }
+
+    // VAL-CROSS-011
+    @MainActor
+    func testCrossAreaConcurrentRoleClaimConflictOrganiserWinsAndPeersConverge() throws {
+        let organiserTransport = MockBluetoothMeshTransport()
+        let organiserMesh = BluetoothMeshService(
+            transport: organiserTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let organiserSync = TreeSyncService(meshService: organiserMesh)
+        let forwardingPeer = UUID(uuidString: "B1111111-0000-0000-0000-000000000001")!
+        organiserTransport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        let participantTransport = MockBluetoothMeshTransport()
+        let participantMesh = BluetoothMeshService(
+            transport: participantTransport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let participantSync = TreeSyncService(meshService: participantMesh)
+        participantTransport.emit(.connectionStateChanged(forwardingPeer, .connected))
+
+        var config = NetworkConfig(
+            networkName: "Claim Conflict",
+            networkID: UUID(uuidString: "B1111111-0000-0000-0000-000000000002")!,
+            createdBy: "organiser-device",
+            pinHash: nil,
+            version: 1,
+            tree: makeFixtureTree()
+        )
+        _ = mutateClaim(nodeID: "alpha", claimedBy: nil, in: &config.tree)
+        organiserSync.setLocalConfig(config)
+        participantSync.setLocalConfig(config)
+
+        let organiserRoleService = RoleClaimService(
+            meshService: organiserMesh,
+            treeSyncService: organiserSync,
+            localDeviceID: "organiser-device",
+            disconnectTimeout: 60
+        )
+        let participantRoleService = RoleClaimService(
+            meshService: participantMesh,
+            treeSyncService: participantSync,
+            localDeviceID: "participant-device",
+            disconnectTimeout: 60
+        )
+
+        XCTAssertEqual(participantRoleService.claim(nodeID: "alpha"), .claimed(nodeID: "alpha"))
+        let participantClaimMessage = try XCTUnwrap(
+            participantTransport.sentPackets
+                .compactMap { try? decodeMessage(from: $0.data) }
+                .first(where: { $0.type == .claim })
+        )
+        organiserRoleService.handleIncomingMessage(participantClaimMessage)
+
+        XCTAssertEqual(organiserRoleService.claim(nodeID: "alpha"), .claimed(nodeID: "alpha"))
+        let organiserClaimMessage = try XCTUnwrap(
+            organiserTransport.sentPackets
+                .compactMap { try? decodeMessage(from: $0.data) }
+                .first(where: { $0.type == .claim })
+        )
+        let rejectionMessage = try XCTUnwrap(
+            organiserTransport.sentPackets
+                .compactMap { try? decodeMessage(from: $0.data) }
+                .first(where: { $0.type == .claimRejected })
+        )
+
+        participantRoleService.handleIncomingMessage(organiserClaimMessage)
+        participantRoleService.handleIncomingMessage(rejectionMessage)
+
+        XCTAssertEqual(participantRoleService.lastClaimRejection, .organiserWins)
+        XCTAssertNil(participantRoleService.activeClaimNodeID)
+        XCTAssertEqual(claimedByValue(nodeID: "alpha", in: organiserSync.localConfig), "organiser-device")
+        XCTAssertEqual(claimedByValue(nodeID: "alpha", in: participantSync.localConfig), "organiser-device")
+    }
+
+    // VAL-CROSS-012
+    func testCrossAreaModelDownloadInterruptionRecoveryThenCactusInitSucceeds() async throws {
+        let sandbox = try makeModelDownloadSandbox()
+        defer { sandbox.cleanup() }
+
+        let resumeData = Data("cross-area-resume-point".utf8)
+        let temporaryModelFile = try makeTemporaryModelFile(in: sandbox.baseDirectory)
+        let downloader = MockURLSessionDownloadClient(
+            scriptedResponses: [
+                .init(
+                    progressEvents: [(300, 1_000)],
+                    result: .failure(URLSessionDownloadClientError.interrupted(resumeData: resumeData))
+                ),
+                .init(
+                    progressEvents: [(900, 1_000), (1_000, 1_000)],
+                    result: .success(temporaryModelFile)
+                )
+            ]
+        )
+        let service = makeModelDownloadService(
+            sandbox: sandbox,
+            downloader: downloader,
+            availableStorageBytes: 20_000_000_000
+        )
+
+        do {
+            _ = try await service.ensureModelAvailable()
+            XCTFail("Expected interruption on first download attempt")
+        } catch let error as ModelDownloadServiceError {
+            guard case let .interrupted(canResume) = error else {
+                return XCTFail("Expected interrupted error, got \(error)")
+            }
+            XCTAssertTrue(canResume)
+        }
+
+        _ = try await service.ensureModelAvailable()
+        let initializer = CactusModelInitializationService(
+            downloadService: service,
+            initFunction: { _, _, _ in
+                UnsafeMutableRawPointer(bitPattern: 0xCAFEBABE)!
+            },
+            destroyFunction: { _ in }
+        )
+        let modelHandle = try await initializer.initializeModel()
+        XCTAssertEqual(modelHandle, UnsafeMutableRawPointer(bitPattern: 0xCAFEBABE))
+    }
+
+    // VAL-CROSS-013
+    @MainActor
+    func testCrossAreaBackgroundingFlushesCompactionQueueAndForegroundRestartsMesh() async throws {
+        let transport = MockBluetoothMeshTransport()
+        let meshService = BluetoothMeshService(
+            transport: transport,
+            deduplicator: MessageDeduplicator(capacity: 1_000)
+        )
+        let peerID = UUID(uuidString: "D1313131-0000-0000-0000-000000000001")!
+        transport.emit(.connectionStateChanged(peerID, .connected))
+
+        let summarizer = MockTacticalSummarizer(outputs: ["Background flush summary"])
+        let coordinator = AppNetworkCoordinator(
+            meshService: meshService,
+            localDeviceID: "alpha-device",
+            mainAudioService: AudioService(
+                capturer: MockAudioCapturer(clips: []),
+                transcriber: MockCactusTranscriber(results: []),
+                maxRecordingDuration: 60
+            ),
+            compactionEngineFactory: { localDeviceID, localNodeID, localSenderRole, initialTree, messageRouter in
+                CompactionEngine(
+                    localDeviceID: localDeviceID,
+                    localNodeID: localNodeID,
+                    localSenderRole: localSenderRole,
+                    initialTree: initialTree,
+                    messageRouter: messageRouter,
+                    summarizer: summarizer,
+                    configuration: .init(timeWindow: 30, messageCountThreshold: 5, defaultTTL: 8)
+                )
+            }
+        )
+
+        var config = NetworkConfig(
+            networkName: "Background Integration",
+            networkID: UUID(uuidString: "D1313131-0000-0000-0000-000000000002")!,
+            createdBy: "organiser-device",
+            pinHash: nil,
+            version: 1,
+            tree: makeFixtureTree()
+        )
+        _ = mutateClaim(nodeID: "alpha", claimedBy: "alpha-device", in: &config.tree)
+        _ = mutateClaim(nodeID: "alpha-1", claimedBy: "alpha-1-device", in: &config.tree)
+        coordinator.treeSyncService.setLocalConfig(config)
+
+        let roleReady = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                coordinator.roleClaimService.activeClaimNodeID == "alpha"
+            }
+        }
+        XCTAssertTrue(roleReady)
+
+        let inboundBroadcast = Message.make(
+            type: .broadcast,
+            senderID: "alpha-1",
+            senderRole: "Alpha 1",
+            parentID: "alpha",
+            treeLevel: 2,
+            ttl: 4,
+            encrypted: false,
+            latitude: nil,
+            longitude: nil,
+            accuracy: nil,
+            transcript: "Contact while app backgrounds."
+        )
+        let inboundData = try JSONEncoder().encode(inboundBroadcast)
+        transport.emit(.receivedData(inboundData, from: peerID))
+
+        XCTAssertTrue(transport.sentPackets.isEmpty, "Compaction should remain queued before background flush.")
+
+        coordinator.handleScenePhase(.background)
+
+        let flushedCompactionPublished = await waitForCondition(timeout: 1.0) { [self] in
+            transport.sentPackets.contains { packet in
+                (try? self.decodeMessage(from: packet.data).type) == .compaction
+            }
+        }
+        XCTAssertTrue(flushedCompactionPublished)
+
+        transport.emit(.connectionStateChanged(peerID, .disconnected))
+        coordinator.handleScenePhase(.active)
+        transport.emit(.connectionStateChanged(peerID, .connected))
+
+        XCTAssertGreaterThanOrEqual(transport.startCallCount, 1)
+        let pttReenabled = await waitForCondition(timeout: 1.0) {
+            await MainActor.run {
+                !coordinator.mainViewModel.isPTTDisabled
+            }
+        }
+        XCTAssertTrue(pttReenabled)
+        XCTAssertGreaterThanOrEqual(coordinator.afterActionReviewViewModel.totalMessageCount, 2)
+    }
+
+    // VAL-CROSS-014
+    @MainActor
+    func testCrossAreaGPSCoordinatesPreservedFromBroadcastToCompactionAndPersistence() {
+        let expectedLatitude = 37.3349
+        let expectedLongitude = -122.0090
+        let expectedAccuracy = 2.5
+        let router = MessageRouter(
+            gpsProvider: {
+                .init(
+                    latitude: expectedLatitude,
+                    longitude: expectedLongitude,
+                    accuracy: expectedAccuracy
+                )
+            }
+        )
+        let tree = makeFixtureTree()
+        let store = InMemoryAfterActionReviewStore()
+
+        let broadcast = router.makeBroadcastMessage(
+            transcript: "Leaf reports contact at checkpoint.",
+            senderID: "alpha-1-device",
+            senderNodeID: "alpha-1",
+            senderRole: "Alpha 1",
+            in: tree
+        )
+        let compaction = router.makeCompactionMessage(
+            summary: "Alpha summary with checkpoint contact.",
+            senderID: "alpha-device",
+            senderNodeID: "alpha",
+            senderRole: "Alpha Lead",
+            in: tree
+        )
+
+        store.persist(broadcast)
+        store.persist(compaction)
+
+        let persisted = store.search(query: "checkpoint")
+        XCTAssertEqual(persisted.count, 2)
+        XCTAssertTrue(
+            persisted.allSatisfy {
+                abs($0.latitude - expectedLatitude) < 0.000_001 &&
+                    abs($0.longitude - expectedLongitude) < 0.000_001 &&
+                    abs($0.accuracy - expectedAccuracy) < 0.000_001 &&
+                    !$0.isFallbackLocation
+            }
+        )
+    }
+
     private func makeCompactionEngine(
         localNodeID: String,
         localDeviceID: String,
@@ -3531,10 +4404,16 @@ private final class MockBluetoothMeshTransport: BluetoothMeshTransporting {
     private var treeConfigByPeer: [UUID: Data] = [:]
     private(set) var lastConfiguredAdvertisement: NetworkAdvertisement?
     private(set) var configuredTreeConfigPayload: Data = Data()
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
 
-    func start() {}
+    func start() {
+        startCallCount += 1
+    }
 
-    func stop() {}
+    func stop() {
+        stopCallCount += 1
+    }
 
     func send(_ data: Data, messageType: Message.MessageType, to peerIDs: Set<UUID>) {
         sentPackets.append(SentPacket(data: data, messageType: messageType, peerIDs: peerIDs))
