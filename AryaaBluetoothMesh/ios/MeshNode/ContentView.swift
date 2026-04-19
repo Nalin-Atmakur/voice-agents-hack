@@ -17,6 +17,7 @@ struct ContentView: View {
     @EnvironmentObject var recon: ReconViewModel
 
     @State private var spokenIDs: Set<String> = []
+    @State private var retryTask: Task<Void, Never>?
 
     var body: some View {
         TabView {
@@ -37,9 +38,14 @@ struct ContentView: View {
         .onChange(of: mesh.messages.count) { _, _ in
             kickOffPendingSummaries()
             speakExactMessages()
+            // After a burst settles, retry any that failed during the burst.
+            scheduleRetry()
         }
         .onChange(of: llm.state) { _, newValue in
-            if newValue == .ready { kickOffPendingSummaries() }
+            if newValue == .ready {
+                kickOffPendingSummaries()
+                summaries.retryPending()
+            }
         }
     }
 
@@ -55,6 +61,18 @@ struct ContentView: View {
             if identity.incomingEdgeType(fromSenderID: msg.senderId) == .summary {
                 summaries.requestSummary(messageID: msg.id, text: msg.payload)
             }
+        }
+    }
+
+    /// Debounced retry: waits 2 seconds after the last message burst, then
+    /// retries any failed summaries. Cancels the previous timer if a new
+    /// message arrives before it fires, so we don't hammer the LLM mid-burst.
+    private func scheduleRetry() {
+        retryTask?.cancel()
+        retryTask = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            summaries.retryPending()
         }
     }
 
@@ -84,6 +102,7 @@ struct ContentView: View {
                 case .done(let s):
                     return DisplayMessage(message: msg, style: .paraphrased, displayPayload: s)
                 case .failed:
+                    // Show original text as fallback while retries may still be pending.
                     return DisplayMessage(message: msg, style: .paraphrased, displayPayload: msg.payload)
                 case .pending:
                     return DisplayMessage(message: msg, style: .awaiting, displayPayload: "…")

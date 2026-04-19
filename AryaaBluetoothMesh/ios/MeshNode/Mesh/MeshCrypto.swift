@@ -1,5 +1,8 @@
 import CryptoKit
 import Foundation
+import os
+
+private let log = Logger(subsystem: "com.cactushack.MeshNode", category: "mesh.crypto")
 
 /// AES-256-GCM symmetric encryption for mesh messages.
 ///
@@ -39,14 +42,23 @@ enum MeshCrypto {
     /// Decrypt data produced by `encrypt(_:)`.
     /// Returns nil if the data is malformed, too short, or the key doesn't match.
     static func decrypt(_ data: Data) -> Data? {
-        guard data.count > header.count else { return nil }
-        guard data.prefix(header.count) == header else { return nil }
-        let payload = data.dropFirst(header.count)
-        guard let box = try? AES.GCM.SealedBox(combined: payload),
-              let plaintext = try? AES.GCM.open(box, using: symmetricKey) else {
+        guard data.count > header.count else {
+            log.warning("Decrypt: data too short (\(data.count) bytes)")
             return nil
         }
-        return plaintext
+        guard data.prefix(header.count) == header else {
+            log.warning("Decrypt: missing MENC header (\(data.count) bytes)")
+            return nil
+        }
+        let payload = data.dropFirst(header.count)
+        do {
+            let box = try AES.GCM.SealedBox(combined: payload)
+            let plaintext = try AES.GCM.open(box, using: symmetricKey)
+            return plaintext
+        } catch {
+            log.warning("Decrypt failed (\(data.count) bytes): \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     /// True if the data starts with the encryption header.

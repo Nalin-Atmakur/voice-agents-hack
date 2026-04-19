@@ -45,6 +45,11 @@ final class LLMService: ObservableObject {
     private let inferenceQueue = DispatchQueue(label: "cactus.infer", qos: .userInitiated)
     private let postProcessor = OutputPostProcessor()
 
+    /// Minimum gap between consecutive inference calls to let the model
+    /// stabilize after stop/reset. Prevents failures during message bursts.
+    private static let inferenceGapMs: UInt64 = 200
+    private var lastInferenceEnd = DispatchTime.now()
+
     /// The TacNet soul persona loaded from the bundled soul.md resource.
     static let soulPrompt: String = {
         guard let url = Bundle.main.url(forResource: "soul", withExtension: "md"),
@@ -185,13 +190,26 @@ final class LLMService: ObservableObject {
 
             log.info("LLM complete (maxTokens=\(maxTokens, privacy: .public), temp=\(temperature, privacy: .public)) prompt: \(messagesJSON, privacy: .public)")
 
-            inferenceQueue.async {
+            inferenceQueue.async { [self] in
+                // Enforce a minimum gap between inference calls so the model
+                // has time to stabilize after stop/reset during message bursts.
+                let elapsed = DispatchTime.now().uptimeNanoseconds - self.lastInferenceEnd.uptimeNanoseconds
+                let gapNanos = Self.inferenceGapMs * 1_000_000
+                if elapsed < gapNanos {
+                    Thread.sleep(forTimeInterval: Double(gapNanos - elapsed) / 1_000_000_000)
+                }
+
                 // Stop + reset to clear all prior state (KV cache, image embeddings).
                 cactusStop(model)
                 cactusReset(model)
-                _ = try? cactusComplete(model, messagesJSON, optionsJSON, nil as String?) { token, _ in
-                    continuation.yield(token)
+                do {
+                    _ = try cactusComplete(model, messagesJSON, optionsJSON, nil as String?) { token, _ in
+                        continuation.yield(token)
+                    }
+                } catch {
+                    log.error("cactusComplete failed: \(error.localizedDescription, privacy: .public)")
                 }
+                self.lastInferenceEnd = DispatchTime.now()
                 continuation.finish()
             }
         }
