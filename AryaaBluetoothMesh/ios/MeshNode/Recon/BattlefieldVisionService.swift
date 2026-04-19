@@ -93,10 +93,13 @@ final class BattlefieldVisionService {
     ) async throws -> ScanResult {
         log.info("Vision scan starting: mode=\(mode.rawValue, privacy: .public) maxTokens=\(mode.maxResponseTokens, privacy: .public) imageBudget=\(mode.tokenBudget, privacy: .public)")
 
+        let maxDim = self.maxModelImageDimension
+        let tempDir = self.tempDirectory
+        let quality = self.jpegQuality
         let prepared = try autoreleasepool {
-            let modelImage = Self.downscaledForModel(image, maxDimension: maxModelImageDimension)
+            let modelImage = Self.downscaledForModel(image, maxDimension: maxDim)
             log.info("Image downscaled: \(Int(modelImage.size.width * modelImage.scale))x\(Int(modelImage.size.height * modelImage.scale))")
-            let imageURL = try Self.writeTempJPEG(modelImage, into: tempDirectory, quality: jpegQuality)
+            let imageURL = try Self.writeTempJPEG(modelImage, into: tempDir, quality: quality)
             return PreparedScanInput(previewImage: modelImage, imageURL: imageURL)
         }
         defer { try? FileManager.default.removeItem(at: prepared.imageURL) }
