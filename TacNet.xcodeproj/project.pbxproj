@@ -37,6 +37,7 @@
 		F1A1001100000000000001B1 /* ReconViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001000000000000001B0 /* ReconViewModel.swift */; };
 		F1A1001300000000000001B3 /* ReconView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001200000000000001B2 /* ReconView.swift */; };
 		F1A1001500000000000001B5 /* TargetFusionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001400000000000001B4 /* TargetFusionTests.swift */; };
+		F1A1001700000000000001B7 /* BattlefieldVisionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001600000000000001B6 /* BattlefieldVisionServiceTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -101,6 +102,7 @@
 		F1A1001000000000000001B0 /* ReconViewModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReconViewModel.swift; sourceTree = "<group>"; };
 		F1A1001200000000000001B2 /* ReconView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReconView.swift; sourceTree = "<group>"; };
 		F1A1001400000000000001B4 /* TargetFusionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TargetFusionTests.swift; sourceTree = "<group>"; };
+		F1A1001600000000000001B6 /* BattlefieldVisionServiceTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BattlefieldVisionServiceTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -290,6 +292,7 @@
 			isa = PBXGroup;
 			children = (
 				F1A1001400000000000001B4 /* TargetFusionTests.swift */,
+				F1A1001600000000000001B6 /* BattlefieldVisionServiceTests.swift */,
 			);
 			path = Recon;
 			sourceTree = "<group>";
@@ -445,6 +448,7 @@
 			files = (
 				CC3B531DE3DD2D794CC8CCDE /* TacNetTests.swift in Sources */,
 				F1A1001500000000000001B5 /* TargetFusionTests.swift in Sources */,
+				F1A1001700000000000001B7 /* BattlefieldVisionServiceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
