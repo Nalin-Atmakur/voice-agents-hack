@@ -104,15 +104,15 @@ final class BattlefieldVisionService {
         }
         defer { try? FileManager.default.removeItem(at: prepared.imageURL) }
 
-        log.info("Waiting for LLM to be ready (state=\(String(describing: llmService.state), privacy: .public))")
-        try await llmService.waitUntilReady()
+        log.info("Waiting for LLM to be ready (state=\(String(describing: self.llmService.state), privacy: .public))")
+        try await self.llmService.waitUntilReady()
 
         let imageExists = FileManager.default.fileExists(atPath: prepared.imageURL.path)
         let imageSize = (try? FileManager.default.attributesOfItem(atPath: prepared.imageURL.path)[.size] as? Int) ?? 0
         log.info("Vision scan: image=\(prepared.imageURL.lastPathComponent, privacy: .public) exists=\(imageExists, privacy: .public) size=\(imageSize, privacy: .public) bytes")
 
         log.info("Calling llmService.complete() with vision message…")
-        let rawResponse = try await llmService.complete(
+        let rawResponse = try await self.llmService.complete(
             messages: try Self.buildMessages(intent: intent, imageURL: prepared.imageURL),
             options: Self.buildOptions(mode: mode)
         )
