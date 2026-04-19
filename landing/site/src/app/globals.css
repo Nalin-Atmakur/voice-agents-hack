@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+/* ───────────────────────────────────────────────────────────
+   TacNet design tokens — Palette A · Tactical lime
+   ─────────────────────────────────────────────────────────── */
+
+@theme {
+  /* surfaces */
+  --color-bg:           #0A0D0B;
+  --color-surface:      #111511;
+  --color-elevated:     #1A1F1A;
+
+  /* borders */
+  --color-border:       #1F251F;
+  --color-border-hot:   #2B3329;
+
+  /* text */
+  --color-text:         #E8ECE9;
+  --color-text-muted:   #8A918C;
+  --color-text-dim:     #5A615C;
+
+  /* accents / signals */
+  --color-accent:       #B8FF2C;
+  --color-accent-soft:  rgba(184, 255, 44, 0.12);
+  --color-signal-amber: #FFB020;
+  --color-signal-red:   #FF4D3A;
+
+  /* fonts — wired via next/font in layout.tsx */
+  --font-sans: var(--font-dm-sans),        ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace,  SFMono-Regular,  monospace;
+
+  /* radii */
+  --radius-panel: 2px;
+  --radius-btn:   2px;
+}
+
+/* ───────────────────────────────────────────────────────────
+   Base
+   ─────────────────────────────────────────────────────────── */
+
+html, body {
+  background: var(--color-bg);
+  color:      var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+}
+
+/* Ensure anchor jumps clear the fixed nav (~72px + some air). */
+section[id] { scroll-margin-top: 96px; }
+
+::selection {
+  background: var(--color-accent);
+  color:      var(--color-bg);
+}
+
+/* ───────────────────────────────────────────────────────────
+   Utilities — used by layout primitives
+   ─────────────────────────────────────────────────────────── */
+
+/* 48px grid overlay (hero + architecture backgrounds) */
+.bg-grid-48 {
+  background-image:
+    linear-gradient(to right,  rgba(232, 236, 233, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(232, 236, 233, 0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* Noise grain — inline SVG fractalNoise, no external file. */
+.bg-noise {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='256' height='256'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.91 0 0 0 0 0.93 0 0 0 0 0.91 0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 256px;
+  opacity: 0.035;
+  mix-blend-mode: overlay;
+}
+
+/* Section corner dots */
+.section-dots::before,
+.section-dots::after {
+  content: '';
+  position: absolute;
+  top: -1.5px;
+  width: 3px; height: 3px;
+  background: rgba(232, 236, 233, 0.2);
+  border-radius: 50%;
+}
+.section-dots::before { left: -1.5px; }
+.section-dots::after  { right: -1.5px; }
+
+/* Pulsing OPERATIONAL dot */
+@keyframes pulse-op {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.pulse-op { animation: pulse-op 2.5s ease-in-out infinite; }
+
+/* Fade-in-up + stagger */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in-up             { animation: fade-in-up 0.55s ease-out both; }
+.landing-stagger-1      { animation-delay: 40ms; }
+.landing-stagger-2      { animation-delay: 120ms; }
+.landing-stagger-3      { animation-delay: 200ms; }
+
+/* ───────────────────────────────────────────────────────────
+   Reduced motion — kill everything that's non-essential
+   ─────────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

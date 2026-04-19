@@ -27,6 +27,10 @@ AryaaBluetoothMesh/ios/MeshNode/Models/
 # See AryaaBluetoothMesh/ios/SETUP.md.
 AryaaBluetoothMesh/ios/Vendor/
 
+# Parakeet model weights for TacNet (bundled in app, too large for git)
+TacNet/Resources/ParakeetCTC/*
+!TacNet/Resources/ParakeetCTC/.gitkeep
+
 # Python venvs / caches (if any in subfolders)
 venv/
 .venv/

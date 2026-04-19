@@ -105,22 +105,32 @@ protocol TranscriptConsuming: Sendable {
 actor CactusTranscriber: CactusTranscribing {
     typealias TranscribeFunction = @Sendable (CactusModelT, Data) throws -> String
 
-    private let modelInitializationService: CactusModelInitializationService
+    private let modelHandleProvider: any ModelHandleProviding
     private let transcribeFunction: TranscribeFunction
 
     init(
-        modelInitializationService: CactusModelInitializationService = .shared,
+        modelHandleProvider: any ModelHandleProviding = CactusModelInitializationService.parakeet,
         transcribeFunction: @escaping TranscribeFunction = { model, pcmData in
             try cactusTranscribe(model, nil, nil, nil, nil, pcmData)
         }
     ) {
-        self.modelInitializationService = modelInitializationService
+        self.modelHandleProvider = modelHandleProvider
         self.transcribeFunction = transcribeFunction
+        NSLog("[STT] CactusTranscriber initialized — STT provider: Parakeet CTC 1.1B (downloaded), LLM: Gemma 4")
     }
 
     func transcribePCM16kMono(_ pcmData: Data) async throws -> String {
-        let modelHandle = try await modelInitializationService.initializeModelAfterEnsuringDownload()
+        NSLog("[STT] Loading model via %@", String(describing: type(of: modelHandleProvider)))
+        let modelHandle: CactusModelT
+        do {
+            modelHandle = try await modelHandleProvider.provideModelHandle()
+        } catch {
+            NSLog("[STT] ⚠️ Primary model failed (%@), falling back to Gemma", error.localizedDescription)
+            modelHandle = try await CactusModelInitializationService.shared.provideModelHandle()
+        }
+        NSLog("[STT] Model handle acquired, transcribing %d bytes of PCM audio", pcmData.count)
         let responseJSON = try transcribeFunction(modelHandle, pcmData)
+        NSLog("[STT] Raw response: %@", responseJSON.prefix(200).description)
         return Self.extractTranscript(from: responseJSON)
     }
 
@@ -887,9 +897,7 @@ final class AVAudioEngineRecorder: NSObject, AudioCapturing, @unchecked Sendable
 
     func startCapture() async throws {
         do {
-            try await MainActor.run {
-                try startCaptureOnMainActor()
-            }
+            try await startCaptureOnMainActor()
         } catch let error as AudioServiceError {
             throw error
         } catch {
@@ -919,25 +927,28 @@ final class AVAudioEngineRecorder: NSObject, AudioCapturing, @unchecked Sendable
     }
 
     @MainActor
-    private func startCaptureOnMainActor() throws {
+    private func startCaptureOnMainActor() async throws {
         guard !isCapturing else {
             throw AudioServiceError.alreadyRecording
         }
 
-        // Log microphone permission status before touching the audio engine.
-        let micStatus: String
-        switch AVAudioApplication.shared.recordPermission {
-        case .granted:   micStatus = "granted"
-        case .denied:    micStatus = "DENIED"
-        case .undetermined: micStatus = "undetermined"
-        @unknown default: micStatus = "unknown"
-        }
-        NSLog("[Audio] Microphone permission: %@", micStatus)
-        guard AVAudioApplication.shared.recordPermission == .granted else {
-            NSLog("[Audio] ❌ Microphone permission not granted — recording will be silent")
-            // Don't throw here; let the user see the permission prompt via the UI.
-            // We continue so that if permission is later granted the engine can start.
+        // Request microphone permission if not yet determined; bail if denied.
+        let permission = AVAudioApplication.shared.recordPermission
+        if permission == .undetermined {
+            NSLog("[Audio] Microphone permission: undetermined — requesting now")
+            let granted = await withCheckedContinuation { cont in
+                AVAudioApplication.requestRecordPermission { result in cont.resume(returning: result) }
+            }
+            NSLog("[Audio] Microphone permission result: %@", granted ? "granted" : "DENIED")
+            guard granted else {
+                NSLog("[Audio] ❌ Microphone permission denied — open Settings → TacNet → Microphone")
+                return
+            }
+        } else if permission == .denied {
+            NSLog("[Audio] ❌ Microphone permission denied — open Settings → TacNet → Microphone")
             return
+        } else {
+            NSLog("[Audio] Microphone permission: granted")
         }
 
         // Configure the audio session for recording BEFORE touching AVAudioEngine.
@@ -1108,8 +1119,8 @@ actor AudioService {
         transcriber: CactusTranscribing = CactusTranscriber(),
         transcriptConsumer: TranscriptConsuming? = nil,
         maxRecordingDuration: TimeInterval = 60,
-        silenceAmplitudeThreshold: Int16 = 500,
-        minimumActiveSamples: Int = 160
+        silenceAmplitudeThreshold: Int16 = 100,
+        minimumActiveSamples: Int = 1
     ) {
         self.capturer = capturer
         self.transcriber = transcriber
@@ -1192,12 +1203,15 @@ actor AudioService {
             let item = pendingClips.removeFirst()
 
             do {
+                NSLog("[STT] Transcribing clip seq=\(item.sequence) (\(item.clip.data.count) bytes, \(String(format: "%.1f", item.clip.durationSeconds))s)")
                 let transcript = try await transcriber.transcribePCM16kMono(item.clip.data)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !transcript.isEmpty else {
+                    NSLog("[STT] ⚠️ Transcription returned empty string for seq=\(item.sequence)")
                     continue
                 }
 
+                NSLog("[STT] ✅ Transcript seq=\(item.sequence): \"\(transcript)\"")
                 let result = TranscriptResult(
                     sequence: item.sequence,
                     transcript: transcript,
@@ -1208,6 +1222,7 @@ actor AudioService {
                     await transcriptConsumer.receiveTranscript(result)
                 }
             } catch {
+                NSLog("[STT] ❌ Transcription failed for seq=\(item.sequence): \(error.localizedDescription)")
                 continue
             }
         }
@@ -1462,11 +1477,15 @@ final class BluetoothMeshService {
             outboundMessage.payload.encrypted = true
         }
 
+        NSLog("[MESH] publish — type: \(outboundMessage.type.rawValue), senderRole: '\(outboundMessage.senderRole)', ttl: \(outboundMessage.ttl), encrypted: \(outboundMessage.payload.encrypted == true ? "yes" : "no")")
+
         guard outboundMessage.ttl > 0 else {
+            NSLog("[MESH] ❌ publish dropped — TTL is 0")
             return
         }
 
         guard !deduplicator.isDuplicate(messageId: outboundMessage.id) else {
+            NSLog("[MESH] ❌ publish dropped — duplicate message ID")
             return
         }
 
@@ -1564,22 +1583,31 @@ final class BluetoothMeshService {
     }
 
     private func handleIncomingData(_ data: Data, from sourcePeerID: UUID) {
+        let shortPeer = sourcePeerID.uuidString.prefix(8)
+        NSLog("[MESH] ← received \(data.count) bytes from peer \(shortPeer)")
+
         let decryptedData: Data
         do {
             decryptedData = try encryptionService.decryptTransportPayload(data)
         } catch {
+            NSLog("[MESH] ❌ decrypt failed from peer \(shortPeer): \(error.localizedDescription)")
             return
         }
 
         guard var inboundMessage = try? decoder.decode(Message.self, from: decryptedData) else {
+            NSLog("[MESH] ❌ JSON decode failed from peer \(shortPeer) (\(decryptedData.count) decrypted bytes)")
             return
         }
 
+        NSLog("[MESH] ← decoded type: \(inboundMessage.type.rawValue), senderRole: '\(inboundMessage.senderRole)', ttl: \(inboundMessage.ttl), from peer \(shortPeer)")
+
         guard inboundMessage.ttl > 0 else {
+            NSLog("[MESH] ← dropped — TTL exhausted (type: \(inboundMessage.type.rawValue))")
             return
         }
 
         guard !deduplicator.isDuplicate(messageId: inboundMessage.id) else {
+            NSLog("[MESH] ← dropped — duplicate (type: \(inboundMessage.type.rawValue))")
             return
         }
 
@@ -1587,6 +1615,7 @@ final class BluetoothMeshService {
         onMessageReceived?(inboundMessage)
 
         guard inboundMessage.ttl > 0 else {
+            NSLog("[MESH] ← not flooding — TTL now 0 after delivery (type: \(inboundMessage.type.rawValue))")
             return
         }
 
@@ -1600,10 +1629,12 @@ final class BluetoothMeshService {
         }
 
         guard !targetPeerIDs.isEmpty else {
+            NSLog("[MESH] flood — type: \(message.type.rawValue), no reachable peers — queuing in relay (queue size now: \(relayQueue.count + 1))")
             relayQueue.append(QueuedRelay(message: message, excludedPeerID: excludedPeerID))
             return
         }
 
+        NSLog("[MESH] flood — type: \(message.type.rawValue), sending to \(targetPeerIDs.count) peer(s)")
         send(message, to: targetPeerIDs)
     }
 
@@ -1628,6 +1659,7 @@ final class BluetoothMeshService {
 
     private func send(_ message: Message, to peerIDs: Set<UUID>) {
         guard let encodedMessage = try? encoder.encode(message) else {
+            NSLog("[MESH] ❌ send failed — JSON encode error for type: \(message.type.rawValue)")
             return
         }
 
@@ -1635,9 +1667,11 @@ final class BluetoothMeshService {
         do {
             outboundPayload = try encryptionService.encryptTransportPayload(encodedMessage)
         } catch {
+            NSLog("[MESH] ❌ send failed — encrypt error: \(error.localizedDescription)")
             return
         }
 
+        NSLog("[MESH] send — type: \(message.type.rawValue), payload: \(outboundPayload.count) bytes, peers: \(peerIDs.count)")
         transport.send(outboundPayload, messageType: message.type, to: peerIDs)
     }
 }
@@ -1735,6 +1769,8 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
         for peerID in peerIDs {
             if let peripheral = connectedPeripherals[peerID],
                let characteristic = discoveredCharacteristicsByPeer[peerID]?[characteristicKind] {
+                let shortID = peerID.uuidString.prefix(8)
+                NSLog("[BLE] → writing \(data.count) bytes to peer \(shortID) via Central path (type: \(messageType.rawValue))")
                 peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
                 continue
             }
@@ -1742,7 +1778,12 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
             if let central = subscribedCentrals[peerID],
                let peripheralManager {
                 let localCharacteristic = localCharacteristic(for: characteristicKind)
-                _ = peripheralManager.updateValue(data, for: localCharacteristic, onSubscribedCentrals: [central])
+                let ok = peripheralManager.updateValue(data, for: localCharacteristic, onSubscribedCentrals: [central])
+                let shortID = peerID.uuidString.prefix(8)
+                NSLog("[BLE] → notifying \(data.count) bytes to peer \(shortID) via Peripheral path (type: \(messageType.rawValue)) — queued: \(ok ? "no" : "yes")")
+            } else {
+                let shortID = peerID.uuidString.prefix(8)
+                NSLog("[BLE] ❌ no delivery path for peer \(shortID) (type: \(messageType.rawValue)) — central connected: \(connectedPeripherals[peerID] != nil ? "yes" : "no"), subscribed: \(subscribedCentrals[peerID] != nil ? "yes" : "no")")
             }
         }
     }
@@ -1767,8 +1808,8 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
 
         pendingTreeConfigReadCompletions[peerID, default: []].append(completion)
 
-        // Timeout: if the GATT read hasn't completed in 10s, fail the join.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+        // Timeout: if the GATT read hasn't completed in 20s, fail the join.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self,
                   self.pendingTreeConfigReadCompletions[peerID] != nil else { return }
             NSLog("[Join] ⏱ requestTreeConfig timed out for peer %@", peerID.uuidString)
@@ -1803,9 +1844,16 @@ final class CoreBluetoothMeshTransport: NSObject, BluetoothMeshTransporting {
         if connectedPeripherals[peerID] != nil {
             NSLog("[Join] Connected but no characteristics yet — triggering service discovery")
             peripheral.discoverServices([BluetoothMeshUUIDs.service])
-        } else if let centralManager, centralManager.state == .poweredOn,
-                  !connectingPeripheralIDs.contains(peerID) {
-            NSLog("[Join] Not connected — initiating connection to peer %@", peerID.uuidString)
+        } else if let centralManager, centralManager.state == .poweredOn {
+            if connectingPeripheralIDs.contains(peerID) {
+                // A previous auto-connect attempt stalled. Cancel it and force a fresh
+                // connect so the user's explicit tap isn't blocked by a stale pending attempt.
+                NSLog("[Join] Stalled auto-connect detected for peer %@ — cancelling and reconnecting", peerID.uuidString)
+                centralManager.cancelPeripheralConnection(peripheral)
+                connectingPeripheralIDs.remove(peerID)
+            } else {
+                NSLog("[Join] Not connected — initiating connection to peer %@", peerID.uuidString)
+            }
             connectingPeripheralIDs.insert(peerID)
             centralManager.connect(peripheral, options: nil)
         } else {
@@ -2053,10 +2101,21 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
                 NSLog("[Join] ❌ treeConfig read error for peer %@: %@",
                       peripheral.identifier.uuidString, error.localizedDescription)
                 completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
-            } else if let value = characteristic.value {
+            } else if let value = characteristic.value, !value.isEmpty {
                 NSLog("[Join] ✅ treeConfig read success for peer %@ — %d bytes",
                       peripheral.identifier.uuidString, value.count)
                 completeTreeConfigReads(for: peripheral.identifier, result: .success(value))
+            } else if characteristic.value?.isEmpty == true {
+                NSLog("[Join] ⚠️ treeConfig read returned 0 bytes for peer %@ — organiser not ready, retrying in 500ms",
+                      peripheral.identifier.uuidString)
+                // The organiser's peripheral hasn't written its treeConfig yet.
+                // Re-read after a short delay; the existing timeout will fire eventually
+                // if the organiser never becomes ready.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self,
+                          self.pendingTreeConfigReadCompletions[peripheral.identifier] != nil else { return }
+                    peripheral.readValue(for: characteristic)
+                }
             } else {
                 NSLog("[Join] ❌ treeConfig read returned nil value for peer %@",
                       peripheral.identifier.uuidString)
