@@ -175,8 +175,17 @@ final class STTService: ObservableObject {
                                      appropriateFor: nil, create: true)
         let writable = appSupport.appendingPathComponent(modelName)
 
+        if fm.fileExists(atPath: writable.path) {
+            // Verify the copy is intact — check a known weight file exists.
+            let probe = writable.appendingPathComponent("layer_0_conv_pointwise1.weights")
+            if !fm.fileExists(atPath: probe.path) {
+                log.warning("Parakeet copy is incomplete — deleting and re-copying")
+                try? fm.removeItem(at: writable)
+            }
+        }
+
         if !fm.fileExists(atPath: writable.path) {
-            log.info("First-run: copying \(modelName, privacy: .public) to Application Support…")
+            log.info("Copying \(modelName, privacy: .public) to Application Support…")
             try fm.copyItem(at: bundleURL, to: writable)
         }
         return writable.path

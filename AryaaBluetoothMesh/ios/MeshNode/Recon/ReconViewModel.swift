@@ -236,7 +236,12 @@ final class ReconViewModel: ObservableObject {
         shouldResumeRange: Bool
     ) async {
         if shouldReloadSTT {
+            // STT reload is best-effort — don't let a corrupt parakeet copy
+            // block the scan result from being displayed.
             sttService?.load()
+            if case .error(let msg) = sttService?.state {
+                log.warning("STT failed to reload after scan: \(msg, privacy: .public)")
+            }
         }
         if shouldResumeRange {
             rangeProvider.resumeAfterInference()
