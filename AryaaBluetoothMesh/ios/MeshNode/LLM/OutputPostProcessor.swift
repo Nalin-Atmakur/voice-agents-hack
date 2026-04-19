@@ -104,14 +104,28 @@ public struct OutputPostProcessor: Sendable {
     ]
 
     private static let selfReferencePhrases: [String] = [
+        // Identity / persona leaks
         "as your ai", "as an ai", "i'm here to help", "let me help",
         "i can assist", "my purpose is", "i'm designed to", "as tacnet",
+        // Chatbot "ready" stalls
         "i'm ready to assist you", "i'm ready to assist", "ready to assist you",
         "ready to help you", "how can i help", "how can i assist",
         "please provide the text", "please provide", "what can i help you with",
         "what would you like", "feel free to ask", "don't hesitate to ask",
         "i'd be happy to", "i'll do my best", "let me know if",
-        "is there anything else", "if you have any questions"
+        "is there anything else", "if you have any questions",
+        // Retrieval-specific chatbot fallbacks
+        "this is an open-ended", "open-ended prompt", "open-ended question",
+        "waiting for a question", "waiting for your question",
+        "please ask a specific", "please ask a question", "please be more specific",
+        "i need more context", "i need more information",
+        "could you clarify", "can you clarify", "could you be more specific",
+        "what specifically", "what exactly would you like",
+        "i don't have enough information", "i don't have enough context",
+        "based on the information provided", "based on the context provided",
+        "i'm not sure what you're asking", "i'm not sure what you mean",
+        "here's what i can tell you", "here is what i can tell you",
+        "let me summarize", "to summarize", "in summary"
     ]
 
     private static let doubleNegatives: [(String, String)] = [

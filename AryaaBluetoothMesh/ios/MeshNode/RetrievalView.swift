@@ -162,18 +162,6 @@ struct RetrievalView: View {
     /// Hard character cap for the chat-context block (~4 chars ≈ 1 token).
     private static let maxContextChars = 1500
 
-    /// Condensed soul for retrieval — keeps Ranger voice but saves tokens
-    /// vs the full soul.md (~4KB). Retrieval is a briefing, not a relay.
-    private static let retrievalSoul = """
-    You are TacNet Personal AI, bonded to one operator. BLE mesh, no cloud.
-    You speak Ranger-net register only. Declarative statements. Present tense.
-    No emoji, no markdown, no filler, no hedging, no pleasantries.
-    Numbers one through eight as words. Say niner not nine. Ten and above as digits.
-    Callsigns only. Doctrine acronyms: EKIA, SITREP, SALUTE, CASEVAC, ACE, LACE, WIA.
-    Unknown data equals UNK. Never fabricate intel or coordinates.
-    All output is TTS-destined. No visual formatting ever.
-    """
-
     private func start() {
         guard let selfID = identity.nodeID else { return }
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -186,64 +174,56 @@ struct RetrievalView: View {
             .sorted { $0.timestamp < $1.timestamp }
             .suffix(Self.maxContextMessages)
 
-        let contextBlock: String
-        if relevant.isEmpty {
-            contextBlock = "(no messages in context)"
-        } else {
-            var lines: [String] = []
-            var charBudget = Self.maxContextChars
-            // Build from most-recent backwards, then reverse so oldest is first.
-            for msg in relevant.reversed() {
-                let short = String(msg.senderId.prefix(6))
-                let ago = Self.relativeTime(msg.timestamp)
-                let line = "\(short) (\(ago)): \(msg.payload)"
-                if charBudget - line.count < 0 { break }
-                charBudget -= line.count
-                lines.append(line)
-            }
-            contextBlock = lines.reversed().joined(separator: "\n")
+        // If there's no context at all, answer immediately without burning LLM tokens.
+        guard !relevant.isEmpty else {
+            answer = "No mesh traffic from reachable nodes. Nothing to brief."
+            composedPrompt = "(no context available)"
+            return
         }
 
-        let reachableList = reachable.map { String($0.prefix(6)) }
-            .sorted().joined(separator: ", ")
+        var lines: [String] = []
+        var charBudget = Self.maxContextChars
+        for msg in relevant.reversed() {
+            let ago = Self.relativeTime(msg.timestamp)
+            let line = "\(msg.senderId) \(ago): \(msg.payload)"
+            if charBudget - line.count < 0 { break }
+            charBudget -= line.count
+            lines.append(line)
+        }
+        let contextBlock = lines.reversed().joined(separator: "\n")
 
-        let userPrompt = """
-        Nodes: \(reachableList)
-        --- Chat context (recent) ---
+        // Simple, flat prompt — minimal structure so Gemma 2B stays on task.
+        // Data first, question last, instruction at the generation boundary.
+        let prompt = """
+        You are a military AI briefer. Use only the radio logs below to answer.
+        Present tense. No emoji. No markdown. Never fabricate. Unknown equals UNK.
+
+        Radio logs:
         \(contextBlock)
-        --- Question ---
-        \(trimmed)
+
+        Operator asks: \(trimmed)
+
+        Give a brief answer using only the logs above. If the logs do not contain the answer, say UNK.
+        Answer:
         """
 
-        composedPrompt = userPrompt
+        composedPrompt = prompt
         answer = ""
         isStreaming = true
 
         streamTask = Task {
-            let fullPrompt = """
-            \(Self.retrievalSoul)
-
-            --- TASK ---
-            Your operator is requesting a briefing. Review the chat context \
-            from the mesh and answer their question. Use Ranger-net register. \
-            Use doctrine formats (SALUTE, SITREP, ACE, LACE) when they fit. \
-            Be thorough: up to five sentences. Synthesize across nodes when \
-            multiple reports overlap. If data is missing, say UNK. \
-            No emoji, no markdown. All output is TTS-destined.
-
-            \(userPrompt)
-
-            Briefing:
-            """
             let messages: [[String: String]] = [
-                ["role": "user", "content": fullPrompt],
+                ["role": "user", "content": prompt],
             ]
             var raw = ""
             for await token in llm.completeStream(messages: messages, maxTokens: 256) {
                 if Task.isCancelled { break }
                 raw += token
             }
-            answer = postProcessor.process(raw, role: .briefing)
+            let processed = postProcessor.process(raw, role: .briefing)
+            // If post-processing stripped everything (model produced only chatbot junk),
+            // show a meaningful fallback instead of blank.
+            answer = processed.isEmpty ? "Unable to brief. Rephrase or check mesh traffic." : processed
             isStreaming = false
         }
     }
