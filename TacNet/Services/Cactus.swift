@@ -1064,9 +1064,6 @@ public actor ModelDownloadService {
                     try? fileManager.removeItem(at: temporaryLocation)
                     NSLog("[ModelDownload] Extraction complete")
 
-                    let extractedCount = (try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path))?.count ?? 0
-                    NSLog("[ModelDownload] Extracted %d files into %@", extractedCount, modelDirectoryURL.path)
-
                     guard fileManager.fileExists(atPath: modelDirectoryURL.path) else {
                         lastNonRecoverableError = .network(
                             underlyingDescription: "Zip extraction completed but the model directory was not found at the expected path. The zip may have a different internal structure."
@@ -1074,9 +1071,45 @@ public actor ModelDownloadService {
                         break retryLoop
                     }
 
+                    // Verify extraction integrity: count files AND check for zero-byte
+                    // weight files that indicate truncated extraction (ZIP64 edge case
+                    // or iOS memory pressure during unzip).
+                    let extractedContents = (try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path)) ?? []
+                    let weightsFiles = extractedContents.filter { ($0 as NSString).pathExtension == "weights" }
+                    NSLog("[ModelDownload] Extracted %d total files (%d .weights) into %@", extractedContents.count, weightsFiles.count, modelDirectoryURL.path)
+
+                    // Check for zero-byte or suspiciously small weight files
+                    var corruptFiles: [String] = []
+                    for weightFile in weightsFiles {
+                        let filePath = modelDirectoryURL.appendingPathComponent(weightFile).path
+                        if let attrs = try? fileManager.attributesOfItem(atPath: filePath),
+                           let size = attrs[.size] as? Int64, size == 0 {
+                            corruptFiles.append(weightFile)
+                        }
+                    }
+
+                    if !corruptFiles.isEmpty {
+                        NSLog("[ModelDownload] ❌ Found %d zero-byte weight files — extraction was incomplete: %@",
+                              corruptFiles.count, corruptFiles.prefix(5).joined(separator: ", "))
+                        try? fileManager.removeItem(at: modelDirectoryURL)
+                        lastNonRecoverableError = .network(
+                            underlyingDescription: "Zip extraction produced \(corruptFiles.count) zero-byte weight files. The archive may be corrupt or extraction was interrupted by memory pressure."
+                        )
+                        break retryLoop
+                    }
+
+                    guard weightsFiles.count >= 500 else {
+                        NSLog("[ModelDownload] ❌ Only %d .weights files extracted (expected 2000+) — extraction incomplete", weightsFiles.count)
+                        try? fileManager.removeItem(at: modelDirectoryURL)
+                        lastNonRecoverableError = .network(
+                            underlyingDescription: "Only \(weightsFiles.count) weight files extracted (expected ~2088). The archive may be corrupt."
+                        )
+                        break retryLoop
+                    }
+
                     // Write the sentinel so future launches can detect a complete download.
                     fileManager.createFile(atPath: modelFileURL.path, contents: nil, attributes: nil)
-                    NSLog("[ModelDownload] Sentinel written at %@, download complete", modelFileURL.path)
+                    NSLog("[ModelDownload] ✅ Integrity check passed — %d weight files verified, sentinel written", weightsFiles.count)
                 } else {
                     // Non-zip payload. In production the real HuggingFace URL
                     // always serves a zip; anything else (e.g. a small HTTP
@@ -1257,19 +1290,32 @@ public actor ModelDownloadService {
             return false
         }
 
-        // Verify the extraction produced a meaningful number of weight files.
-        // A truncated or corrupt extraction may leave the sentinel in place
-        // but with missing or zero-byte weight files, causing cactusInit to
-        // crash with "Cannot map file". Require at least 500 .weights files
-        // (the Gemma 4 model has ~2076).
+        // Verify the extraction produced a meaningful number of weight files
+        // AND that none are zero-byte (truncated). A corrupt extraction may
+        // leave the sentinel in place but with broken weight files, causing
+        // cactusInit to crash with "Cannot map file".
         if let contents = try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path) {
-            let weightsCount = contents.filter { ($0 as NSString).pathExtension == "weights" }.count
-            if weightsCount < 500 {
-                NSLog("[ModelDownload] ⚠️ Integrity check failed — only %d .weights files found (expected 2000+), forcing re-download", weightsCount)
+            let weightsFiles = contents.filter { ($0 as NSString).pathExtension == "weights" }
+            if weightsFiles.count < 500 {
+                NSLog("[ModelDownload] ⚠️ Integrity check failed — only %d .weights files found (expected 2000+), forcing re-download", weightsFiles.count)
                 try? fileManager.removeItem(at: modelDirectoryURL)
                 try? fileManager.removeItem(at: modelFileURL)
                 userDefaults.set(false, forKey: completionKey)
                 return false
+            }
+
+            // Spot-check a sample of weight files for zero-byte corruption
+            let sampleFiles = Array(weightsFiles.prefix(20))
+            for fileName in sampleFiles {
+                let filePath = modelDirectoryURL.appendingPathComponent(fileName).path
+                if let attrs = try? fileManager.attributesOfItem(atPath: filePath),
+                   let size = attrs[.size] as? Int64, size == 0 {
+                    NSLog("[ModelDownload] ⚠️ Zero-byte weight file detected: %@ — forcing re-download", fileName)
+                    try? fileManager.removeItem(at: modelDirectoryURL)
+                    try? fileManager.removeItem(at: modelFileURL)
+                    userDefaults.set(false, forKey: completionKey)
+                    return false
+                }
             }
         }
 
