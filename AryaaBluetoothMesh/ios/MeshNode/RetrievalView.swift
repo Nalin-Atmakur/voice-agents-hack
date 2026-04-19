@@ -194,10 +194,11 @@ struct RetrievalView: View {
         }
         let contextBlock = lines.reversed().joined(separator: "\n")
 
-        // Simple, flat prompt — minimal structure so Gemma 2B stays on task.
+        // Flat prompt with identity anchors to prevent chatbot fallbacks.
         // Data first, question last, instruction at the generation boundary.
         let prompt = """
-        You are a military AI briefer. Use only the radio logs below to answer.
+        You are TacNet Personal AI. You are not a chatbot. You do not converse. \
+        You are a military briefer. You answer questions using radio logs. \
         Present tense. No emoji. No markdown. Never fabricate. Unknown equals UNK.
 
         Radio logs:
@@ -205,7 +206,7 @@ struct RetrievalView: View {
 
         Operator asks: \(trimmed)
 
-        Give a brief answer using only the logs above. If the logs do not contain the answer, say UNK.
+        Answer using only the logs above. If the logs lack the answer, say UNK.
         Answer:
         """
 
@@ -218,7 +219,7 @@ struct RetrievalView: View {
                 ["role": "user", "content": prompt],
             ]
             var raw = ""
-            for await token in llm.completeStream(messages: messages, maxTokens: 128) {
+            for await token in llm.completeStream(messages: messages, maxTokens: 128, temperature: 0.2) {
                 if Task.isCancelled { break }
                 raw += token
             }
