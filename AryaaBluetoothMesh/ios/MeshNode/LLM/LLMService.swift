@@ -109,7 +109,13 @@ final class LLMService: ObservableObject {
 
         return try await withCheckedThrowingContinuation { continuation in
             inferenceQueue.async {
+                // Stop any in-flight generation, then fully reset KV cache
+                // and token history. cactusStop is critical for vision calls —
+                // without it, stale image embedding state from a previous
+                // vision call can corrupt subsequent completions.
+                cactusStop(model)
                 cactusReset(model)
+                log.info("Model stopped + reset before completion")
                 do {
                     let result = try cactusComplete(
                         model,
@@ -121,7 +127,8 @@ final class LLMService: ObservableObject {
                     log.info("LLM complete result (\(result.count) chars): \(result.prefix(300), privacy: .public)")
                     continuation.resume(returning: result)
                 } catch {
-                    log.error("LLM complete failed: \(error.localizedDescription, privacy: .public)")
+                    let cactusErr = cactusGetLastError()
+                    log.error("LLM complete FAILED: \(error.localizedDescription, privacy: .public) cactusError='\(cactusErr, privacy: .public)'")
                     continuation.resume(throwing: error)
                 }
             }
@@ -179,7 +186,8 @@ final class LLMService: ObservableObject {
             log.info("LLM complete (maxTokens=\(maxTokens, privacy: .public), temp=\(temperature, privacy: .public)) prompt: \(messagesJSON, privacy: .public)")
 
             inferenceQueue.async {
-                // Clear any prior conversation state so each call is independent.
+                // Stop + reset to clear all prior state (KV cache, image embeddings).
+                cactusStop(model)
                 cactusReset(model)
                 _ = try? cactusComplete(model, messagesJSON, optionsJSON, nil as String?) { token, _ in
                     continuation.yield(token)
