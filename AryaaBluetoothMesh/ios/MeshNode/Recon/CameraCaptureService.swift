@@ -127,6 +127,10 @@ final class CameraCaptureService: NSObject, ObservableObject {
         guard isConfigured else {
             throw CameraCaptureError.configurationFailed("not configured")
         }
+        // Prevent concurrent captures — the previous continuation would be orphaned.
+        guard pendingContinuation == nil else {
+            throw CameraCaptureError.captureFailed("capture already in progress")
+        }
 
         let settings = AVCapturePhotoSettings()
         settings.flashMode = .off

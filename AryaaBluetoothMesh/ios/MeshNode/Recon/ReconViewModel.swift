@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import UIKit
+import os
+
+private let log = Logger(subsystem: "com.cactushack.MeshNode", category: "recon.vm")
 
 @MainActor
 final class ReconViewModel: ObservableObject {
@@ -191,7 +194,23 @@ final class ReconViewModel: ObservableObject {
             status = .idle
         } catch {
             await restoreRealtimeServices(shouldReloadSTT: shouldReloadSTT, shouldResumeRange: shouldResumeRange)
-            status = .error(error.localizedDescription)
+            let message: String
+            if let visionError = error as? BattlefieldVisionServiceError {
+                switch visionError {
+                case .modelReturnedNoVisionOutput(let detail):
+                    message = detail
+                case .invalidModelResponse(let detail):
+                    message = "Bad model output: \(detail)"
+                case .failedToEncodeImage:
+                    message = "Failed to encode camera image."
+                case .failedToWriteTempImage(let detail):
+                    message = "Failed to save image: \(detail)"
+                }
+            } else {
+                message = error.localizedDescription
+            }
+            log.error("Scan failed: \(message, privacy: .public)")
+            status = .error(message)
         }
     }
 

@@ -92,7 +92,9 @@ final class LLMService: ObservableObject {
             optionsJSON = encoded
         }
 
-        log.info("LLM complete raw request: \(messagesJSON, privacy: .public)")
+        let hasImages = messagesJSON.contains("\"images\"")
+        log.info("LLM complete (hasImages=\(hasImages, privacy: .public), options=\(optionsJSON ?? "nil", privacy: .public))")
+        log.info("LLM request body: \(messagesJSON.prefix(400), privacy: .public)")
 
         return try await withCheckedThrowingContinuation { continuation in
             inferenceQueue.async {
@@ -105,8 +107,10 @@ final class LLMService: ObservableObject {
                         nil as String?,
                         nil as ((String, UInt32) -> Void)?
                     )
+                    log.info("LLM complete result (\(result.count) chars): \(result.prefix(300), privacy: .public)")
                     continuation.resume(returning: result)
                 } catch {
+                    log.error("LLM complete failed: \(error.localizedDescription, privacy: .public)")
                     continuation.resume(throwing: error)
                 }
             }

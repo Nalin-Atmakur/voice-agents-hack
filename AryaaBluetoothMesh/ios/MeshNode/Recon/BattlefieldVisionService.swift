@@ -1,10 +1,14 @@
 import Foundation
 import UIKit
+import os
+
+private let log = Logger(subsystem: "com.cactushack.MeshNode", category: "recon.vision")
 
 enum BattlefieldVisionServiceError: Error, Equatable {
     case failedToEncodeImage
     case failedToWriteTempImage(String)
     case invalidModelResponse(String)
+    case modelReturnedNoVisionOutput(String)
 }
 
 enum ReconScanMode: String, CaseIterable, Sendable, Codable {
@@ -79,12 +83,21 @@ final class BattlefieldVisionService {
         defer { try? FileManager.default.removeItem(at: prepared.imageURL) }
 
         try await llmService.waitUntilReady()
+
+        let imageExists = FileManager.default.fileExists(atPath: prepared.imageURL.path)
+        log.info("Vision scan: image=\(prepared.imageURL.path, privacy: .public) exists=\(imageExists, privacy: .public) mode=\(mode.rawValue, privacy: .public)")
+
         let rawResponse = try await llmService.complete(
             messages: try Self.buildMessages(intent: intent, imageURL: prepared.imageURL),
             options: Self.buildOptions(mode: mode)
         )
+
+        log.info("Vision raw response (\(rawResponse.count) chars): \(rawResponse.prefix(500), privacy: .public)")
+
+        let detections = try Self.parseDetections(from: rawResponse)
+        log.info("Parsed \(detections.count) detections")
         return ScanResult(
-            detections: try Self.parseDetections(from: rawResponse),
+            detections: detections,
             previewImage: prepared.previewImage
         )
     }
@@ -128,12 +141,21 @@ final class BattlefieldVisionService {
 
     private static func parseDetections(from response: String) throws -> [RawDetection] {
         let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
+        guard !trimmed.isEmpty else {
+            log.warning("Vision model returned empty response")
+            throw BattlefieldVisionServiceError.modelReturnedNoVisionOutput(
+                "Model returned empty response — vision may not be reaching the model."
+            )
+        }
 
         let jsonString = stripMarkdownFence(from: trimmed)
         guard let start = jsonString.firstIndex(of: "["),
               let end = jsonString.lastIndex(of: "]") else {
-            return []
+            // Model returned text but no JSON array — likely chatbot fallback.
+            log.warning("Vision response has no JSON array: \(trimmed.prefix(200), privacy: .public)")
+            throw BattlefieldVisionServiceError.modelReturnedNoVisionOutput(
+                "Model did not return detections. Raw: \(String(trimmed.prefix(120)))"
+            )
         }
         let slice = String(jsonString[start...end])
 
