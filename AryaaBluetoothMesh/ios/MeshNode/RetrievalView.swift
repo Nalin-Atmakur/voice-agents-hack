@@ -162,6 +162,18 @@ struct RetrievalView: View {
     /// Hard character cap for the chat-context block (~4 chars ≈ 1 token).
     private static let maxContextChars = 1500
 
+    /// Condensed soul for retrieval — keeps Ranger voice but saves tokens
+    /// vs the full soul.md (~4KB). Retrieval is a briefing, not a relay.
+    private static let retrievalSoul = """
+    You are TacNet Personal AI, bonded to one operator. BLE mesh, no cloud.
+    You speak Ranger-net register only. Declarative statements. Present tense.
+    No emoji, no markdown, no filler, no hedging, no pleasantries.
+    Numbers one through eight as words. Say niner not nine. Ten and above as digits.
+    Callsigns only. Doctrine acronyms: EKIA, SITREP, SALUTE, CASEVAC, ACE, LACE, WIA.
+    Unknown data equals UNK. Never fabricate intel or coordinates.
+    All output is TTS-destined. No visual formatting ever.
+    """
+
     private func start() {
         guard let selfID = identity.nodeID else { return }
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -201,7 +213,6 @@ struct RetrievalView: View {
         \(contextBlock)
         --- Question ---
         \(trimmed)
-        Answer concisely in Ranger-net register. Max 20 words.
         """
 
         composedPrompt = userPrompt
@@ -209,8 +220,21 @@ struct RetrievalView: View {
         isStreaming = true
 
         streamTask = Task {
-            // Merge soul into user turn — Gemma has no native system role.
-            let fullPrompt = LLMService.soulPrompt + "\n\n--- TASK ---\n" + userPrompt
+            let fullPrompt = """
+            \(Self.retrievalSoul)
+
+            --- TASK ---
+            Your operator is requesting a briefing. Review the chat context \
+            from the mesh and answer their question. Use Ranger-net register. \
+            Use doctrine formats (SALUTE, SITREP, ACE, LACE) when they fit. \
+            Be thorough: up to five sentences. Synthesize across nodes when \
+            multiple reports overlap. If data is missing, say UNK. \
+            No emoji, no markdown. All output is TTS-destined.
+
+            \(userPrompt)
+
+            Briefing:
+            """
             let messages: [[String: String]] = [
                 ["role": "user", "content": fullPrompt],
             ]
@@ -219,7 +243,7 @@ struct RetrievalView: View {
                 if Task.isCancelled { break }
                 raw += token
             }
-            answer = postProcessor.process(raw, role: .leader)
+            answer = postProcessor.process(raw, role: .briefing)
             isStreaming = false
         }
     }
