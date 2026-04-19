@@ -1,10 +1,4 @@
 commands:
-  build: xcodebuild build -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
-  clean-build: xcodebuild clean build -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
-  test: xcodebuild test -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
-  test-ui: xcodebuild test -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' -only-testing:TacNetUITests
-  test-unit: xcodebuild test -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' -only-testing:TacNetTests
-  clean: xcodebuild clean -project TacNet.xcodeproj -scheme TacNet
-  warnings-only: xcodebuild clean build -project TacNet.xcodeproj -scheme TacNet -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' 2>&1 | grep ': warning:' | grep -v 'cactus.framework'
-
-services: {}
+  build-device: xcrun xcodebuild -project TacNet.xcodeproj -scheme TacNet -configuration Debug -destination 'generic/platform=iOS' -sdk iphoneos build CODE_SIGNING_ALLOWED=NO
+  build-sim: xcrun xcodebuild -project TacNet.xcodeproj -scheme TacNet -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build CODE_SIGNING_ALLOWED=NO
+  test: xcrun xcodebuild -project TacNet.xcodeproj -scheme TacNet -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test CODE_SIGNING_ALLOWED=NO
