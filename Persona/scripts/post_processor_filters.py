@@ -27,6 +27,10 @@ APPROVED_ACRONYMS: set[str] = {
     "CCIR", "PIR", "EEI", "PACE", "ROE", "METT-TC", "SOP", "TTP", "CAS",
     "WIA", "PC", "HVT", "LZ", "PZ", "ORP", "SBF", "TRP", "PL", "LD", "SP",
     "RP", "NVG", "GPNVG", "BLE", "UNK", "RTN",
+    # Tactical terms added to match Swift implementation
+    "CONTACT", "SPOTREP", "KIA", "MIA", "POW", "FRAGO", "OPORD", "WARNO",
+    "RPG", "IED", "TIC", "QRF", "TOC", "FLOT", "LOA", "EOF", "NLT", "IOT",
+    "ISO", "IVO", "DMR", "SAW",
 }
 
 # Classification markers and structural keywords that look like acronyms but
@@ -59,7 +63,7 @@ FILLER_PHRASES: list[str] = [
     "I understand", "Copy that", "Roger let me think", "Understood",
     "Acknowledged", "Let me check", "Sure", "Okay so", "Alright", "OK",
     "Well", "So", "Basically", "Actually", "Right so", "Yeah", "Yes sir",
-    "Got it", "Affirmative",
+    "Got it", "Affirmative", "Roger", "Copy",
 ]
 
 HEDGE_PHRASES: list[str] = [
@@ -864,6 +868,10 @@ def run_chain(
     """
     global _warnings
     _warnings = []
+
+    # Early return for empty/whitespace-only input
+    if not text or not text.strip():
+        return "", []
 
     # --- CATEGORY 1: FORMATTING ---
     text = hh_001_strip_emojis(text)

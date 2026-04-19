@@ -41,7 +41,7 @@ public struct OutputPostProcessor: Sendable {
         "GPNVG", "BLE", "UNK", "RTN", "AI", "TL", "SL", "NCO", "CQB", "QRF",
         "TOC", "FLOT", "LOA", "TIC", "RPG", "IED", "EOF", "KIA", "MIA", "POW",
         "FRAGO", "OPORD", "WARNO", "IP", "IR", "NLT", "IOT", "ISO", "VIC", "IVO",
-        "METT-TC"
+        "METT-TC", "CONTACT", "SPOTREP", "DMR", "SAW"
     ]
 
     private static let profanityWords: Set<String> = [
