@@ -109,7 +109,7 @@ actor CactusTranscriber: CactusTranscribing {
     private let transcribeFunction: TranscribeFunction
 
     init(
-        modelHandleProvider: any ModelHandleProviding = BundledModelInitializationService.parakeet,
+        modelHandleProvider: any ModelHandleProviding = CactusModelInitializationService.shared,
         transcribeFunction: @escaping TranscribeFunction = { model, pcmData in
             try cactusTranscribe(model, nil, nil, nil, nil, pcmData)
         }
@@ -2083,10 +2083,21 @@ extension CoreBluetoothMeshTransport: CBPeripheralDelegate {
                 NSLog("[Join] ❌ treeConfig read error for peer %@: %@",
                       peripheral.identifier.uuidString, error.localizedDescription)
                 completeTreeConfigReads(for: peripheral.identifier, result: .failure(error))
-            } else if let value = characteristic.value {
+            } else if let value = characteristic.value, !value.isEmpty {
                 NSLog("[Join] ✅ treeConfig read success for peer %@ — %d bytes",
                       peripheral.identifier.uuidString, value.count)
                 completeTreeConfigReads(for: peripheral.identifier, result: .success(value))
+            } else if characteristic.value?.isEmpty == true {
+                NSLog("[Join] ⚠️ treeConfig read returned 0 bytes for peer %@ — organiser not ready, retrying in 500ms",
+                      peripheral.identifier.uuidString)
+                // The organiser's peripheral hasn't written its treeConfig yet.
+                // Re-read after a short delay; the existing timeout will fire eventually
+                // if the organiser never becomes ready.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self,
+                          self.pendingTreeConfigReadCompletions[peripheral.identifier] != nil else { return }
+                    peripheral.readValue(for: characteristic)
+                }
             } else {
                 NSLog("[Join] ❌ treeConfig read returned nil value for peer %@",
                       peripheral.identifier.uuidString)

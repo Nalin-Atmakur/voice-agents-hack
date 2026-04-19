@@ -999,10 +999,8 @@ public actor ModelDownloadService {
         synchronizeCompletionState() ? modelDirectoryURL.path : nil
     }
 
-    /// Deletes the model directory and sentinel so the next launch triggers a fresh download.
-    /// Called when cactusInit fails (e.g. a corrupt weight file that passed the sentinel check).
     public func invalidateDownload() {
-        NSLog("[ModelDownload] ⚠️ Invalidating model cache — will re-download on next launch")
+        NSLog("[ModelDownload] ⚠️ Invalidating model cache — will re-download on next use")
         try? fileManager.removeItem(at: modelDirectoryURL)
         try? fileManager.removeItem(at: modelFileURL)
         userDefaults.set(false, forKey: completionKey)
@@ -1154,19 +1152,13 @@ public actor ModelDownloadService {
                         NSLog("[ModelDownload] ❌ Found %d zero-byte weight files — extraction was incomplete: %@",
                               corruptFiles.count, corruptFiles.prefix(5).joined(separator: ", "))
                         try? fileManager.removeItem(at: modelDirectoryURL)
-                        lastNonRecoverableError = .network(
-                            underlyingDescription: "Zip extraction produced \(corruptFiles.count) zero-byte weight files. The archive may be corrupt or extraction was interrupted by memory pressure."
-                        )
-                        break retryLoop
+                        continue
                     }
 
                     guard weightsFiles.count >= 500 else {
                         NSLog("[ModelDownload] ❌ Only %d .weights files extracted (expected 2000+) — extraction incomplete", weightsFiles.count)
                         try? fileManager.removeItem(at: modelDirectoryURL)
-                        lastNonRecoverableError = .network(
-                            underlyingDescription: "Only \(weightsFiles.count) weight files extracted (expected ~2088). The archive may be corrupt."
-                        )
-                        break retryLoop
+                        continue
                     }
 
                     // Write the sentinel so future launches can detect a complete download.
@@ -1445,12 +1437,29 @@ public actor CactusModelInitializationService {
     }
 
     private func initialize(using modelPath: String) async throws -> CactusModelT {
+        // Pre-flight: check for zero-byte .weights files left by a corrupt extraction.
+        // These cause cactusInit to throw "Cannot map file" — catch them early so we
+        // can invalidate the cache and trigger a clean re-download.
+        let fm = FileManager.default
+        if let files = try? fm.contentsOfDirectory(atPath: modelPath) {
+            let corrupt = files.filter { name in
+                guard (name as NSString).pathExtension == "weights" else { return false }
+                let attrs = try? fm.attributesOfItem(atPath: (modelPath as NSString).appendingPathComponent(name))
+                return (attrs?[.size] as? Int ?? 1) == 0
+            }
+            if !corrupt.isEmpty {
+                NSLog("[ModelDownload] ❌ Pre-flight found %d zero-byte .weights file(s) — invalidating cache", corrupt.count)
+                await downloadService.invalidateDownload()
+                throw CactusModelInitializationError.initializationFailed("Corrupt model: \(corrupt.count) zero-byte weight file(s)")
+            }
+        }
+
         do {
             let handle = try initFunction(modelPath, nil, false)
             loadedModelHandle = handle
             return handle
         } catch {
-            NSLog("[ModelDownload] ❌ cactusInit failed — invalidating cache so re-download triggers on next launch: %@", error.localizedDescription)
+            NSLog("[ModelDownload] ❌ cactusInit failed — invalidating cache: %@", error.localizedDescription)
             await downloadService.invalidateDownload()
             throw CactusModelInitializationError.initializationFailed(error.localizedDescription)
         }
