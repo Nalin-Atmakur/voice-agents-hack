@@ -175,19 +175,22 @@ final class LLMService: ObservableObject {
         }
     }
 
+    /// Condensed persona for summarization — keeps Ranger voice without
+    /// eating half the context window. The full soul.md (~4KB / ~1000 tokens)
+    /// caused context overflow on messages longer than ~2 sentences.
+    private static let summarySoul = """
+    You are a military signal relay. Rewrite operator messages as terse \
+    third-person reports. Present tense. No emoji. No markdown. No filler. \
+    Callsigns only. Unknown equals UNK. Output is TTS-destined.
+    """
+
     func summarise(_ text: String, role: OutputPostProcessor.EarpieceRole = .summary) async -> String {
-        // Merge soul into the user turn so it works even if the model's chat
-        // template ignores the system role (Gemma has no native system turn).
+        let cap = role.wordCap
         let userPrompt = """
-        \(Self.soulPrompt)
+        \(Self.summarySoul)
+        Compact this message to max \(cap) words. Output only the relay.
 
-        --- TASK ---
-        Compact the following operator message into a terse third-person relay. \
-        Max \(role.wordCap) words. No preamble, no quotes, no commentary. \
-        Output only the compacted relay.
-
-        Message:
-        \(text)
+        Message: \(text)
 
         Relay:
         """
