@@ -38,6 +38,8 @@
 		F1A1001300000000000001B3 /* ReconView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001200000000000001B2 /* ReconView.swift */; };
 		F1A1001500000000000001B5 /* TargetFusionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001400000000000001B4 /* TargetFusionTests.swift */; };
 		F1A1001700000000000001B7 /* BattlefieldVisionServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A1001600000000000001B6 /* BattlefieldVisionServiceTests.swift */; };
+		F1A2B3C4D5E6F708192A3B4C /* TextToSpeechService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A2B3C4D5E6F708192A3B40 /* TextToSpeechService.swift */; };
+		F1A2B3C4D5E6F708192A3B4D /* ParakeetCTC in Resources */ = {isa = PBXBuildFile; fileRef = F1A2B3C4D5E6F708192A3B41 /* ParakeetCTC */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -103,6 +105,8 @@
 		F1A1001200000000000001B2 /* ReconView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReconView.swift; sourceTree = "<group>"; };
 		F1A1001400000000000001B4 /* TargetFusionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TargetFusionTests.swift; sourceTree = "<group>"; };
 		F1A1001600000000000001B6 /* BattlefieldVisionServiceTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BattlefieldVisionServiceTests.swift; sourceTree = "<group>"; };
+		F1A2B3C4D5E6F708192A3B40 /* TextToSpeechService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TextToSpeechService.swift; sourceTree = "<group>"; };
+		F1A2B3C4D5E6F708192A3B41 /* ParakeetCTC */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ParakeetCTC; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -154,6 +158,7 @@
 			isa = PBXGroup;
 			children = (
 				DCC08F62BEAD6B96F2F1A649 /* Info.plist */,
+				F1A2B3C4D5E6F708192A3B41 /* ParakeetCTC */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -207,6 +212,7 @@
 				F1A1000800000000000001A8 /* HeadingProvider.swift */,
 				F1A1000A00000000000001AA /* RangeProvider.swift */,
 				F1A1000400000000000001A4 /* TargetFusion.swift */,
+				F1A2B3C4D5E6F708192A3B40 /* TextToSpeechService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -391,6 +397,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F1A2B3C4D5E6F708192A3B4D /* ParakeetCTC in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -439,6 +446,7 @@
 				F1A1000F00000000000001AF /* CameraPreviewRepresentable.swift in Sources */,
 				F1A1001100000000000001B1 /* ReconViewModel.swift in Sources */,
 				F1A1001300000000000001B3 /* ReconView.swift in Sources */,
+				F1A2B3C4D5E6F708192A3B4C /* TextToSpeechService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

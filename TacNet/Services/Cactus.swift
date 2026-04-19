@@ -719,6 +719,14 @@ public struct ModelDownloadConfiguration: Sendable {
         modelFileName: ".complete",
         requiresZipArchive: true
     )
+
+    public static let parakeet = ModelDownloadConfiguration(
+        modelURL: URL(string: "https://huggingface.co/Cactus-Compute/parakeet-ctc-1.1b/resolve/main/weights/parakeet-ctc-1.1b-apple.zip")!,
+        expectedModelSizeBytes: 1_800_000_000,
+        modelDirectoryName: "parakeet-ctc-1.1b",
+        modelFileName: ".complete",
+        requiresZipArchive: true
+    )
 }
 
 public struct ModelDownloadRequest: Sendable {
@@ -774,7 +782,18 @@ public enum URLSessionDownloadClientError: Error {
     case httpError(statusCode: Int)
 }
 
-public final class URLSessionDownloadClient: NSObject, URLSessionDownloading {
+public final class URLSessionDownloadClient: NSObject, URLSessionDownloading, @unchecked Sendable {
+    /// Shared singleton for Gemma — AppDelegate references this to reconnect background session events.
+    public static let shared = URLSessionDownloadClient(sessionIdentifier: "com.tacnet.model-download")
+
+    /// Shared singleton for Parakeet STT model.
+    public static let parakeet = URLSessionDownloadClient(sessionIdentifier: "com.tacnet.parakeet-download")
+
+    public static let backgroundSessionIdentifier = "com.tacnet.model-download"
+    public static let parakeetSessionIdentifier = "com.tacnet.parakeet-download"
+
+    public let sessionIdentifier: String
+
     private struct CallbackBundle {
         let progress: @Sendable (Int64, Int64) -> Void
         let completion: @Sendable (Result<URL, Error>) -> Void
@@ -783,14 +802,31 @@ public final class URLSessionDownloadClient: NSObject, URLSessionDownloading {
     private let lock = NSLock()
     private var callbacksByTaskID: [Int: CallbackBundle] = [:]
     private var downloadedLocationsByTaskID: [Int: URL] = [:]
+    // Stored by AppDelegate when iOS wakes the app to deliver background session events.
+    private var backgroundSystemCompletionHandler: (() -> Void)?
 
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
+    // URLSession is var! so it can be assigned after super.init() when self is available.
+    // Background session: iOS runs the download in a separate daemon — survives screen-lock,
+    // app backgrounding, and OS-initiated app termination.
+    private var session: URLSession!
+
+    public init(sessionIdentifier: String) {
+        self.sessionIdentifier = sessionIdentifier
+        super.init()
+        let config = URLSessionConfiguration.background(withIdentifier: sessionIdentifier)
         config.timeoutIntervalForRequest = 300
         config.timeoutIntervalForResource = 86400
         config.waitsForConnectivity = true
-        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
-    }()
+        config.isDiscretionary = false       // start immediately, don't wait for low-power window
+        config.sessionSendsLaunchEvents = true  // wake the app when the download finishes
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    /// Called by AppDelegate when iOS wakes the app for a completed background session.
+    /// Must be called before application(_:handleEventsForBackgroundURLSession:) returns.
+    public func handleBackgroundSessionEvents(completionHandler: @escaping () -> Void) {
+        lock.withLock { backgroundSystemCompletionHandler = completionHandler }
+    }
 
     public func download(
         request: ModelDownloadRequest,
@@ -900,6 +936,18 @@ extension URLSessionDownloadClient: URLSessionDownloadDelegate {
 
         callbackBundle.completion(.success(downloadedLocation))
     }
+
+    // Called by iOS after all background session events have been delivered.
+    // Invoking the stored system handler tells iOS the app has processed the events
+    // and its snapshot can be updated.
+    public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        let handler = lock.withLock {
+            let h = backgroundSystemCompletionHandler
+            backgroundSystemCompletionHandler = nil
+            return h
+        }
+        DispatchQueue.main.async { handler?() }
+    }
 }
 
 public enum ModelDownloadServiceError: Error, Equatable {
@@ -918,6 +966,12 @@ public actor ModelDownloadService {
 
     public static let live = ModelDownloadService()
 
+    public static let parakeet = ModelDownloadService(
+        configuration: .parakeet,
+        downloader: URLSessionDownloadClient.parakeet,
+        persistenceKeyPrefix: "TacNet.ParakeetDownload"
+    )
+
     private let configuration: ModelDownloadConfiguration
     private let downloader: URLSessionDownloading
     private let storageChecker: StorageChecking
@@ -929,7 +983,7 @@ public actor ModelDownloadService {
 
     public init(
         configuration: ModelDownloadConfiguration = .live,
-        downloader: URLSessionDownloading = URLSessionDownloadClient(),
+        downloader: URLSessionDownloading = URLSessionDownloadClient.shared,
         storageChecker: StorageChecking = VolumeStorageChecker(),
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
@@ -964,16 +1018,26 @@ public actor ModelDownloadService {
         synchronizeCompletionState() ? modelDirectoryURL.path : nil
     }
 
+    public func invalidateDownload() {
+        NSLog("[ModelDownload] ⚠️ Invalidating model cache — will re-download on next use")
+        try? fileManager.removeItem(at: modelDirectoryURL)
+        try? fileManager.removeItem(at: modelFileURL)
+        userDefaults.set(false, forKey: completionKey)
+    }
+
     private static let maxRetryAttempts = 5
     private static let retryBaseDelay: UInt64 = 2_000_000_000 // 2 seconds in nanoseconds
 
     @discardableResult
     public func ensureModelAvailable(progressHandler: ProgressHandler? = nil) async throws -> URL {
         if synchronizeCompletionState() {
-            NSLog("[ModelDownload] Model already present at %@, skipping download", modelDirectoryURL.path)
+            NSLog("[ModelDownload] ✅ %@ already present — skipping download", configuration.modelDirectoryName)
             progressHandler?(1.0)
             return modelDirectoryURL
         }
+
+        NSLog("[ModelDownload] 🚀 Starting download of %@ from %@",
+              configuration.modelDirectoryName, configuration.modelURL.absoluteString)
 
         // Diagnostic: log what's currently in applicationSupportDirectory so we
         // can confirm whether orphaned model files are present before migrating.
@@ -991,18 +1055,26 @@ public actor ModelDownloadService {
             return modelDirectoryURL
         }
 
+        // During extraction both the zip and the extracted files exist simultaneously,
+        // so require 2× the model size (zip ~6.4 GB + extracted ~8.1 GB).
+        let requiredStorage = configuration.expectedModelSizeBytes * 2
         let availableStorage = try storageChecker.availableStorageBytes(for: applicationSupportDirectory)
-        NSLog("[ModelDownload] Storage check — available: %lld bytes, required: %lld bytes", availableStorage, configuration.expectedModelSizeBytes)
-        guard availableStorage >= configuration.expectedModelSizeBytes else {
+        NSLog("[ModelDownload] Storage check — available: %lld bytes, required: %lld bytes", availableStorage, requiredStorage)
+        guard availableStorage >= requiredStorage else {
             throw ModelDownloadServiceError.insufficientStorage(
-                requiredBytes: configuration.expectedModelSizeBytes,
+                requiredBytes: requiredStorage,
                 availableBytes: availableStorage
             )
         }
 
         try fileManager.createDirectory(at: modelDirectoryURL, withIntermediateDirectories: true)
 
-        let progressReporter = ProgressReporter(progressHandler: progressHandler)
+        let modelName = configuration.modelDirectoryName
+        let loggingHandler: ProgressHandler = { pct in
+            NSLog("[ModelDownload] 📥 %@ — %.0f%%", modelName, pct * 100)
+            progressHandler?(pct)
+        }
+        let progressReporter = ProgressReporter(progressHandler: loggingHandler)
         progressReporter.report(0)
 
         var lastNonRecoverableError: ModelDownloadServiceError?
@@ -1056,16 +1128,28 @@ public actor ModelDownloadService {
                         try fileManager.removeItem(at: modelDirectoryURL)
                     }
 
-                    NSLog("[ModelDownload] Extracting zip to %@", modelDirectoryURL.path)
-                    // The zip contains 2088 .weights files at its root (no top-level
-                    // subdirectory), so extract directly into modelDirectoryURL so
-                    // all files land in the right place for cactusInit.
-                    try fileManager.unzipItem(at: temporaryLocation, to: modelDirectoryURL)
-                    try? fileManager.removeItem(at: temporaryLocation)
-                    NSLog("[ModelDownload] Extraction complete")
+                    // Move zip from the volatile tmp directory into Application Support
+                    // before extraction. iOS can purge /tmp at any time; Application
+                    // Support is persistent and survives across extraction (which can
+                    // take several minutes for 6.4 GB on device).
+                    let stableZipURL = applicationSupportDirectory
+                        .appendingPathComponent("gemma-download-staging.zip")
+                    if fileManager.fileExists(atPath: stableZipURL.path) {
+                        try? fileManager.removeItem(at: stableZipURL)
+                    }
+                    try fileManager.moveItem(at: temporaryLocation, to: stableZipURL)
+                    NSLog("[ModelDownload] Zip staged at %@ — beginning extraction", stableZipURL.path)
 
-                    let extractedCount = (try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path))?.count ?? 0
-                    NSLog("[ModelDownload] Extracted %d files into %@", extractedCount, modelDirectoryURL.path)
+                    // The zip contains 2088 .weights files at its root (no top-level
+                    // subdirectory), so extract directly into modelDirectoryURL.
+                    do {
+                        try fileManager.unzipItem(at: stableZipURL, to: modelDirectoryURL)
+                    } catch {
+                        try? fileManager.removeItem(at: stableZipURL)
+                        throw error
+                    }
+                    try? fileManager.removeItem(at: stableZipURL)
+                    NSLog("[ModelDownload] Extraction complete")
 
                     guard fileManager.fileExists(atPath: modelDirectoryURL.path) else {
                         lastNonRecoverableError = .network(
@@ -1074,9 +1158,39 @@ public actor ModelDownloadService {
                         break retryLoop
                     }
 
+                    // Verify extraction integrity: count files AND check for zero-byte
+                    // weight files that indicate truncated extraction (ZIP64 edge case
+                    // or iOS memory pressure during unzip).
+                    let extractedContents = (try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path)) ?? []
+                    let weightsFiles = extractedContents.filter { ($0 as NSString).pathExtension == "weights" }
+                    NSLog("[ModelDownload] Extracted %d total files (%d .weights) into %@", extractedContents.count, weightsFiles.count, modelDirectoryURL.path)
+
+                    // Check for zero-byte or suspiciously small weight files
+                    var corruptFiles: [String] = []
+                    for weightFile in weightsFiles {
+                        let filePath = modelDirectoryURL.appendingPathComponent(weightFile).path
+                        if let attrs = try? fileManager.attributesOfItem(atPath: filePath),
+                           let size = attrs[.size] as? Int64, size == 0 {
+                            corruptFiles.append(weightFile)
+                        }
+                    }
+
+                    if !corruptFiles.isEmpty {
+                        NSLog("[ModelDownload] ❌ Found %d zero-byte weight files — extraction was incomplete: %@",
+                              corruptFiles.count, corruptFiles.prefix(5).joined(separator: ", "))
+                        try? fileManager.removeItem(at: modelDirectoryURL)
+                        continue
+                    }
+
+                    guard weightsFiles.count >= 500 else {
+                        NSLog("[ModelDownload] ❌ Only %d .weights files extracted (expected 2000+) — extraction incomplete", weightsFiles.count)
+                        try? fileManager.removeItem(at: modelDirectoryURL)
+                        continue
+                    }
+
                     // Write the sentinel so future launches can detect a complete download.
                     fileManager.createFile(atPath: modelFileURL.path, contents: nil, attributes: nil)
-                    NSLog("[ModelDownload] Sentinel written at %@, download complete", modelFileURL.path)
+                    NSLog("[ModelDownload] ✅ Integrity check passed — %d weight files verified, sentinel written", weightsFiles.count)
                 } else {
                     // Non-zip payload. In production the real HuggingFace URL
                     // always serves a zip; anything else (e.g. a small HTTP
@@ -1257,6 +1371,35 @@ public actor ModelDownloadService {
             return false
         }
 
+        // Verify the extraction produced a meaningful number of weight files
+        // AND that none are zero-byte (truncated). A corrupt extraction may
+        // leave the sentinel in place but with broken weight files, causing
+        // cactusInit to crash with "Cannot map file".
+        if let contents = try? fileManager.contentsOfDirectory(atPath: modelDirectoryURL.path) {
+            let weightsFiles = contents.filter { ($0 as NSString).pathExtension == "weights" }
+            if weightsFiles.count < 500 {
+                NSLog("[ModelDownload] ⚠️ Integrity check failed — only %d .weights files found (expected 2000+), forcing re-download", weightsFiles.count)
+                try? fileManager.removeItem(at: modelDirectoryURL)
+                try? fileManager.removeItem(at: modelFileURL)
+                userDefaults.set(false, forKey: completionKey)
+                return false
+            }
+
+            // Spot-check a sample of weight files for zero-byte corruption
+            let sampleFiles = Array(weightsFiles.prefix(20))
+            for fileName in sampleFiles {
+                let filePath = modelDirectoryURL.appendingPathComponent(fileName).path
+                if let attrs = try? fileManager.attributesOfItem(atPath: filePath),
+                   let size = attrs[.size] as? Int64, size == 0 {
+                    NSLog("[ModelDownload] ⚠️ Zero-byte weight file detected: %@ — forcing re-download", fileName)
+                    try? fileManager.removeItem(at: modelDirectoryURL)
+                    try? fileManager.removeItem(at: modelFileURL)
+                    userDefaults.set(false, forKey: completionKey)
+                    return false
+                }
+            }
+        }
+
         userDefaults.set(true, forKey: completionKey)
         return true
     }
@@ -1271,8 +1414,13 @@ public actor CactusModelInitializationService {
     public typealias InitFunction = (String, String?, Bool) throws -> CactusModelT
     public typealias DestroyFunction = (CactusModelT) -> Void
 
-    /// Shared singleton — all components use one model handle, preventing double-load (~5.6 GB RAM).
+    /// Gemma 4 singleton — used for LLM completion.
     public static let shared = CactusModelInitializationService()
+
+    /// Parakeet CTC singleton — used for speech-to-text transcription.
+    public static let parakeet = CactusModelInitializationService(
+        downloadService: .parakeet
+    )
 
     private let downloadService: ModelDownloadService
     private let initFunction: InitFunction
@@ -1300,7 +1448,7 @@ public actor CactusModelInitializationService {
             throw CactusModelInitializationError.downloadIncomplete
         }
 
-        return try initialize(using: modelDirectoryPath)
+        return try await initialize(using: modelDirectoryPath)
     }
 
     public func initializeModelAfterEnsuringDownload(
@@ -1311,7 +1459,7 @@ public actor CactusModelInitializationService {
         }
 
         let modelDirectory = try await downloadService.ensureModelAvailable(progressHandler: progressHandler)
-        return try initialize(using: modelDirectory.path)
+        return try await initialize(using: modelDirectory.path)
     }
 
     public func destroyModelIfLoaded() {
@@ -1320,14 +1468,104 @@ public actor CactusModelInitializationService {
         self.loadedModelHandle = nil
     }
 
-    private func initialize(using modelPath: String) throws -> CactusModelT {
+    private func initialize(using modelPath: String) async throws -> CactusModelT {
+        // Pre-flight: check for zero-byte .weights files left by a corrupt extraction.
+        // These cause cactusInit to throw "Cannot map file" — catch them early so we
+        // can invalidate the cache and trigger a clean re-download.
+        let fm = FileManager.default
+        if let files = try? fm.contentsOfDirectory(atPath: modelPath) {
+            let corrupt = files.filter { name in
+                guard (name as NSString).pathExtension == "weights" else { return false }
+                let attrs = try? fm.attributesOfItem(atPath: (modelPath as NSString).appendingPathComponent(name))
+                return (attrs?[.size] as? Int ?? 1) == 0
+            }
+            if !corrupt.isEmpty {
+                NSLog("[ModelDownload] ❌ Pre-flight found %d zero-byte .weights file(s) — invalidating cache", corrupt.count)
+                await downloadService.invalidateDownload()
+                throw CactusModelInitializationError.initializationFailed("Corrupt model: \(corrupt.count) zero-byte weight file(s)")
+            }
+        }
+
         do {
             let handle = try initFunction(modelPath, nil, false)
             loadedModelHandle = handle
             return handle
         } catch {
+            NSLog("[ModelDownload] ❌ cactusInit failed — invalidating cache: %@", error.localizedDescription)
+            await downloadService.invalidateDownload()
             throw CactusModelInitializationError.initializationFailed(error.localizedDescription)
         }
+    }
+}
+
+// MARK: - Model handle abstraction
+
+public protocol ModelHandleProviding: Sendable {
+    func provideModelHandle() async throws -> CactusModelT
+}
+
+extension CactusModelInitializationService: ModelHandleProviding {
+    public func provideModelHandle() async throws -> CactusModelT {
+        try await initializeModelAfterEnsuringDownload()
+    }
+}
+
+// MARK: - Bundled model initialization (for models shipped inside the app bundle)
+
+public enum BundledModelError: Error, Equatable {
+    case resourceNotFound(String)
+    case initializationFailed(String)
+}
+
+public actor BundledModelInitializationService: ModelHandleProviding {
+    public typealias InitFunction = (String, String?, Bool) throws -> CactusModelT
+    public typealias DestroyFunction = (CactusModelT) -> Void
+
+    public static let parakeet = BundledModelInitializationService(
+        bundleResourceDirectory: "ParakeetCTC"
+    )
+
+    private let bundleResourceDirectory: String
+    private let initFunction: InitFunction
+    private let destroyFunction: DestroyFunction
+    private var loadedModelHandle: CactusModelT?
+
+    public init(
+        bundleResourceDirectory: String,
+        initFunction: @escaping InitFunction = cactusInit,
+        destroyFunction: @escaping DestroyFunction = cactusDestroy
+    ) {
+        self.bundleResourceDirectory = bundleResourceDirectory
+        self.initFunction = initFunction
+        self.destroyFunction = destroyFunction
+    }
+
+    public func provideModelHandle() async throws -> CactusModelT {
+        if let loadedModelHandle {
+            return loadedModelHandle
+        }
+
+        guard let bundlePath = Bundle.main.path(forResource: bundleResourceDirectory, ofType: nil) else {
+            throw BundledModelError.resourceNotFound(
+                "Bundled model '\(bundleResourceDirectory)' not found in app bundle"
+            )
+        }
+
+        NSLog("[BundledModel] Loading model from bundle path: %@", bundlePath)
+        do {
+            let handle = try initFunction(bundlePath, nil, false)
+            loadedModelHandle = handle
+            NSLog("[BundledModel] Model loaded successfully from %@", bundleResourceDirectory)
+            return handle
+        } catch {
+            throw BundledModelError.initializationFailed(error.localizedDescription)
+        }
+    }
+
+    public func destroyModelIfLoaded() {
+        guard let loadedModelHandle else { return }
+        destroyFunction(loadedModelHandle)
+        self.loadedModelHandle = nil
     }
 }
 

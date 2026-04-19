@@ -1,0 +1,81 @@
+# Snapshot 01 — Cold Open: Zoom Into the Hunt
+
+**Timecode:** 0:00 – 0:06
+**Beat:** A slow, disciplined descent from very-high bird's-eye onto a remote fortified compound (think Operation Neptune Spear / Abbottabad). The raid is already planned and in execution: the 10-operator team is widely dispersed, infiltrating the objective from multiple vectors across open terrain, while a lone sniper holds elevated overwatch hundreds of meters out. The shot telegraphs scale, isolation, and precision — the viewer reads Tier-1 black-ops before a single word is spoken.
+
+## Camera & Movement
+- **Pure bird's-eye (top-down), dead vertical 90°** for the entire shot. No perspective, no tilt — the camera is always looking straight down.
+- Gimbal-stabilized drone, 24mm-equivalent, 2-stop ND, minimal drift.
+- **Slow continuous altitude descent** — a push-in zoom executed as a physical altitude drop:
+  - **Start (0:00, ~180 m altitude):** extreme-high bird's-eye. The entire compound fits inside the middle third of the frame; a large ring of surrounding terrain is visible — walled crop plots, the dirt approach road, irrigation ditches, the olive/poplar tree line, the distant ridge with the sniper's hide, terraced farm land receding to the horizon. At this altitude the operators are tiny pixel-sized specks, just barely resolvable as moving forms.
+  - **Mid (0:03, ~100 m altitude):** the compound now occupies roughly half the frame. Elements become clearly distinguishable as small human figures with subtle IR strobe flickers, their dispersal pattern across the landscape readable at a glance.
+  - **End (0:06, ~40 m altitude):** low bird's-eye, compound fills ~70% of the frame. Each operator is resolvable with individual kit detail, HUD callout labels have locked on to every helmet.
+- Descent curve is smooth ease-out — slower at the bottom, giving the last second of the shot time to breathe before the cut.
+- No orbit, no yaw — pure top-down descent. The compound stays locked in the center.
+
+## Action in Frame (top-down, choreographed dispersal)
+Every operator is clearly visible and meaningfully separated — nothing is stacked on top of anything else. The whole point is to read the dispersal like a map.
+
+- **The Compound (`AC-1`)** is centered: roughly one acre, irregular rectangular walled footprint, 14–18 ft concrete perimeter walls topped with rusted razor-wire coils. Inside the walls are the three-story main residence (A1) in the north half with one dim amber bulb glowing behind a curtained 2nd-floor northwest window, the single-story guesthouse/annex (A2) in the southwest corner, a rusted diesel generator shed, a chicken coop, a weathered vegetable patch, and a battered white Toyota Hilux parked askew near A1. A wide steel vehicle gate sits on the south wall beneath a bare orange bulb; a narrow pedestrian gate is in the west wall. Surrounding the compound: hard-packed dirt road, irrigation ditches glinting faintly, walled crop plots to the west, ragged olive and poplar tree line to the east, dry-stone wall to the west, open fields sloping south.
+
+- **Element Alpha (5 operators)** is infiltrating from the **west**, moving in a loose staggered column with ~6–8 m spacing between operators — not a tight stack. They are traversing a walled crop plot, coming through a gap cut in the low dry-stone wall, moving toward the **west pedestrian gate** of the compound. Order front-to-back along their axis: Breacher on point (breaching kit slung), A1 second, TL-A third, A2 fourth, SL at the tail — the single orange IR chemlight on the back of SL's helmet is the only warm pinprick of color on the west approach. Their DBAL-I2 IR lasers throw thin green needle-lines forward along the dirt; to the naked eye invisible, in NVG-rendered aesthetic these lines are drawn faintly on the image.
+
+- **Element Bravo (4 operators)** is infiltrating from the **east**, independently and symmetrically, moving single-file along the irrigation ditch parallel to the east wall with ~5–6 m spacing. Order front-to-back: TL-B on point, B1 second, B2 third, Medic at the tail. They are moving toward the **southeast corner** of the compound, where they will scale the outer wall. Their silhouettes are bent low, shoulders just above the ditch lip.
+
+- **Sniper (callsign `OVER`, 1 operator)** is deliberately **far** from the compound — prone on the flat roof of a small isolated farm outbuilding **~320 m north-northeast** of the compound, on elevated terrain along a low ridge. In the wide starting frame he is a tiny distinct silhouette on an otherwise empty rooftop. A rolled shemagh rests his suppressed Mk22-pattern DMR across the parapet. A single thin DBAL IR beam paints the compound's northwest 2nd-floor window from his position — this beam is the only visual line connecting the sniper's island to the rest of the action.
+
+- **Mesh visualization (diegetic):** as the camera descends, faint dashed cyan threads bloom in one by one connecting every operator to every other operator in real time — the BLE mesh rendered as light, like fireflies strung on a web. The threads stretch across the full width of the frame at the starting altitude (sniper ↔ Alpha ↔ Bravo ↔ SL), emphasizing the mesh scales across distance. Packets pulse softly along the threads.
+
+- **Atmosphere:** ankle-height dust drifting across the dirt road in thin ribbons (displaced where operators have walked, giving a faint trail). Weak orange bulb over the south gate throws its tiny dim circle. The amber rectangle of light from the northwest 2nd-floor window of A1 is the only other warm point in the frame. Everything else reads as cold teal-green darkness.
+
+## Diegetic HUD Overlay (holographic, layered ON the image)
+The HUD fades in progressively with the descent — it behaves like a drone sensor's target-recognition layer acquiring the scene as it gets closer. Never covers any operator, weapon, the gates, or the amber-lit 2nd-floor window.
+
+- **0:00 – 0:02 (high altitude):** Only these elements are visible —
+  - The **TacNet wordmark** resolves top-center in thin mono at 30% opacity, then starts migrating down-right to its corner lockup.
+  - Dim amber lower-third status band fades in:
+    ```
+    TACNET // MESH ONLINE  10/10 NODES  BLE · OFFLINE · ON-DEVICE SLM
+    AC-1 // REMOTE COMPOUND // DISPERSED ASSAULT
+    ```
+  - Bottom-left timestamp: `03:02:14`.
+  - A single faint pale-green `AC-1` label tags the compound from the top of the frame.
+
+- **0:02 – 0:04 (mid altitude, elements resolvable):** Element-level labels drop in —
+  - `ELEMENT ALPHA · 5` (pale green `#7FFFA9`) pinned over the west approach cluster with a single callout tick.
+  - `ELEMENT BRAVO · 4` pinned over the east approach cluster.
+  - `OVER · SNIPER · 320 m` pinned to the sniper's rooftop with a long callout line drawn across the empty space back toward the compound.
+  - The 10-node command-tree micrographic appears in the **top-right** corner:
+    ```
+    [SL]
+     ├─ [TL-A] ── A1  A2  BREACHER
+     ├─ [TL-B] ── B1  B2  MEDIC
+     └─ [OVER]
+    ```
+    Nodes pulse pale-green one after another as the tree handshakes across the mesh.
+
+- **0:04 – 0:06 (low altitude):** Per-operator callouts lock on —
+  - Small pale-green `#7FFFA9` labels pinned with thin tick lines to each helmet: `SL` (slightly larger, with subtle orange IR glow), `TL-A`, `A1`, `A2`, `BREACHER`, `TL-B`, `B1`, `B2`, `MEDIC`, `OVER`. Labels track with their operators as they move.
+  - The dashed cyan BLE-mesh threads now pulse clearly between all ten nodes.
+  - Bottom-right: `TACNET` wordmark lockup at 40% opacity has reached its final resting position.
+
+- Color key (inherits Style Bible): pale-green `#7FFFA9` for `[SOLDIER → AI]` style labels, dim amber `#FFB347` for status/routing metadata, bright cyan-white `#EAFBFF` reserved for the leader earpiece (not used in this shot; arrives in 02).
+- All HUD glyphs sit in negative space — fields, rooftops, sky-at-night void around the frame. No glyph crosses an operator body, a rifle, or the compound gates.
+
+## Audio
+- Opens on near silence — a thin high-altitude wind, 1 Hz rumble from the drone sensor characterization.
+- A single dog barks once in the distance, then stops.
+- As the camera descends the sound world "focuses" — faint crunch of boots on packed dirt fades up (just Bravo along the ditch; Alpha's footfalls stay masked by the crop plot).
+- Quiet electronic "handshake" chimes — one soft mono tone per operator as their HUD label locks on. Ten chimes across the 6 seconds, rising in pitch. The tenth chime lands on the cut.
+- No score.
+
+## Consistent Visual Details (inherits README Style Bible)
+- 16:9 cinematic frame composed for a 2.39:1 anamorphic letterbox crop. 4K source with subtle 35mm grain. Gate weave off.
+- Palette: teal-green shadows, warm amber highlights on the single 2nd-floor window and the south-gate bulb, crushed blacks with a faint green lift, anamorphic horizontal flares on IR strobes and HUD glyphs. Midtones desaturated ~20%.
+- Time/weather: 0300, moonless overcast high clouds, ~8°C, dry, ankle-height dust drifting across hard-packed dirt. No fog, no rain.
+- Location: the fortified walled compound `AC-1` as defined in the README Style Bible — 1-acre footprint, 14–18 ft concrete walls with razor wire, three-story main residence A1, single-story annex A2, inner courtyard with Hilux/generator shed/chicken coop/vegetable patch, south vehicle gate + west pedestrian gate, surrounded by walled crop plots, dirt road with irrigation ditches, olive/poplar tree line, distant ridge and terraced farmland.
+- Operators: all 10 in identical sterile Tier-1 kit per the Style Bible (Crye G3 multicam-black, Ops-Core FAST with IR strobes, GPNVG-18 flipped up on helmets, Peltor ComTac, JPC 2.0, Safariland drop-leg Glock 19). Nine carry the 10.3" URG-I M4 with SOCOM Mini 2 suppressor, 1-6x LPVO, DBAL-I2 IR laser. The **Sniper (`OVER`)** carries a suppressed Mk22-pattern DMR per the README Sniper Kit Exception. No patches, no flags.
+- HUD: diegetic holographic AR overlay on the image, thin monospace all-caps, color key per the Style Bible, command-tree micrographic top-right, timestamp bottom-left, TACNET lockup bottom-right.
+
+## Image-Generator Prompt
+> Photoreal cinematic pure top-down dead-vertical bird's-eye drone frame, 90° overhead, 24mm look, 16:9 composed for a 2.39:1 anamorphic letterbox crop, 4K with subtle 35mm grain, shot at 0300 hours on a moonless overcast night with thin high clouds, very dark ambient, dry and cold air, ankle-height dust ribbons drifting across hard-packed dirt — no fog, no rain, no asphalt. Captured MID-DESCENT from an extreme-high bird's-eye altitude of roughly 180 meters slowly pushing in to roughly 40 meters, so the target compound is visible with a generous ring of its surrounding isolated rural landscape. Centered in the frame is a fortified walled residential compound on a remote rural plain evocative of the Abbottabad / Operation Neptune Spear compound: one-acre irregular rectangular footprint, fourteen-to-eighteen-foot weathered concrete outer perimeter walls topped with coils of rusting razor wire, a wide steel vehicle gate on the south face beneath a single bare orange incandescent bulb throwing a weak circle on the dirt, a narrow pedestrian gate on the west face; inside the walls a three-story concrete-and-stucco main residence (A1) in the north half with weathered cream paint, small deep-set barred windows, a flat roof with waist-high parapet privacy walls, and one dim amber rectangle of warm light bleeding from a curtained 2nd-floor northwest window; a separate single-story cinderblock guesthouse annex (A2) in the southwest corner of the courtyard; a rusted diesel generator shed; a chicken coop; a weathered vegetable patch; a battered white Toyota Hilux parked askew near A1. Surrounding terrain is clearly visible because of the high altitude: walled crop plots with dry grass to the west, a long low dry-stone wall along the west edge, a narrow hard-packed dirt approach road bisected by irrigation ditches that glint faintly, a ragged olive and poplar tree line to the east, terraced farmland sloping south, and a distant dusty mountain ridge on the horizon. A coordinated ten-man Tier-1 special forces raid is already in execution across this landscape in clearly dispersed top-down choreography — nothing is bunched, everything reads like a tactical map: Element Alpha of five operators infiltrating from the west in a loose staggered column with roughly six-to-eight meters of spacing between each operator, moving through a walled crop plot and through a gap in the dry-stone wall toward the west pedestrian gate, order front-to-back Breacher on point carrying slung breaching kit then A1, TL-A, A2, and Squad Leader at the tail identified by a single orange IR chemlight glowing on the back of his helmet; Element Bravo of four operators simultaneously infiltrating from the east independently, single-file along the irrigation ditch parallel to the east wall with roughly five-to-six meters of spacing, bent low, shoulders just above the ditch lip, moving toward the southeast corner of the compound where they will scale the wall, order front-to-back TL-B on point then B1, B2, and Medic at the tail; one Sniper (callsign OVER) deliberately positioned far from the compound, prone on the flat roof of a small isolated farm outbuilding roughly 320 meters to the north-northeast on slightly elevated ridge terrain, a tiny distinct silhouette on an otherwise empty rooftop resting a suppressed Mk22-pattern DMR across a rolled shemagh on the parapet, throwing a single thin DBAL IR laser line across the wide empty space to paint the compound's 2nd-floor northwest window. All nine assault operators wear identical sterile Tier-1 kit: Crye Precision G3 combat uniform in multicam-black, Ops-Core FAST ballistic helmets with IR strobes pulsing on the back plate, four-tube GPNVG-18 panoramic night vision flipped up on helmets, Peltor ComTac headsets with boom mics, Crye JPC 2.0 plate carriers with zero patches and zero flags, Safariland drop-leg Glock 19 holsters, carrying 10.3 inch URG-I-pattern M4 carbines with SureFire SOCOM Mini 2 suppressors, Vortex 1-6x LPVOs, Steiner DBAL-I2 IR lasers, and Magpul MS4 slings. Thin dashed cyan firefly-like threads span the full width of the frame connecting every operator to every other operator visualizing a live BLE mesh that scales across hundreds of meters, with packets softly pulsing along the threads. Palette: teal-green shadows, warm amber highlights only on the single 2nd-floor northwest window and the south gate bulb, crushed blacks with a faint green lift, anamorphic horizontal flares on IR strobes and HUD glyphs, midtones desaturated twenty percent. Layered DIRECTLY ON TOP OF THE IMAGE as a transparent holographic AR drone-sensor overlay (NOT a split-screen panel, NOT a solid block) in thin monospace all-caps typography with subtle CRT scanlines, micro glitch every two seconds, Gaussian bloom, and only three-to-five percent darkened backing behind glyph footprints: the TacNet wordmark resolving top-center and migrating down to a bottom-right lockup at forty percent opacity, a dim amber lower-third status band reading "TACNET // MESH ONLINE  10/10 NODES  BLE · OFFLINE · ON-DEVICE SLM" above a second line "AC-1 // REMOTE COMPOUND // DISPERSED ASSAULT", a pale-green "AC-1" tag pinned to the compound, element-level callouts "ELEMENT ALPHA · 5" and "ELEMENT BRAVO · 4" and "OVER · SNIPER · 320 m" pinned with thin tick lines to each element cluster and to the distant sniper rooftop, ten small pale-green #7FFFA9 per-operator labels — SL, TL-A, A1, A2, BREACHER, TL-B, B1, B2, MEDIC, OVER — locked onto each helmet with short tick lines, a 10-node command-tree micrographic in the top-right corner with nodes pulsing pale green, and a bottom-left timestamp reading "03:02:14". HUD text MUST NEVER cover any operator, any weapon, either gate, or the amber-lit 2nd-floor window — all glyphs sit in negative space over empty fields, rooftops, and the black void of the night horizon. Hyper-realistic, cinematic, disciplined, isolated, tense, pre-contact silence, evocative of a covert high-value-target compound assault.
